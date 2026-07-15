@@ -20,11 +20,27 @@
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
-      "edgeToEdgeEnabled": true
+      "edgeToEdgeEnabled": true,
+      "permissions": [],
+      "package": "com.littlefinger28.jairCalendGastos"
     },
     "web": {
-      "favicon": "./assets/favicon.png"
+      "favicon": "./assets/favicon.png",
+      "manifest": {
+        "name": "Calendario Gastos",
+        "short_name": "Calendario",
+        "start_url": ".",
+        "display": "standalone",
+        "background_color": "#ffffff",
+        "theme_color": "#ffffff",
+        "description": "Jair, apontar os dias de trabalho e despesas"
+      }
     },
-    "description": "Jair, apontar os dias de trabalho e despesas"
+    "description": "Jair, apontar os dias de trabajo y despesas",
+    "extra": {
+      "eas": {
+        "projectId": "cdcaa810-fd69-4af3-9832-8e3ee3b6ad4d"
+      }
+    }
   }
 }
