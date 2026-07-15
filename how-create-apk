@@ -1,0 +1,27 @@
+No expo code, exporter os ficheiros e por no git
+Code > CodeSpaces > 3 linhas > new terminal
+npm install -g eas-cli
+npm install
+gerar o token no expo : https://expo.dev/settings/access-tokens → Create token → copia o valor
+export EXPO_TOKEN=cola_aqui_o_teu_token
+eas whoami
+eas build:configure
+editar o eas.json :
+"preview": {
+  "android": {
+    "buildType": "apk"
+  }
+}
+por exemplo
+"preview": {
+  "distribution": "internal",
+  "android": {
+    "buildType": "apk"
+  }
+}
+ctrl+s
+eas build --profile preview --platform android
+id: com.littlefinger28.jairCalendGastos
+androidKeystore yes
+DONE. build queue and progress 30 min + 10 min 
+guardar link
