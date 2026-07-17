@@ -7,10 +7,16 @@ import {
   TextInput,
   TouchableOpacity,
   StyleSheet,
-  Platform
+  Platform,
+  Alert,
+  Modal,
+  Image,
+  Button
 } from "react-native";
 import { StatusBar } from "expo-status-bar";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import * as ImagePicker from "expo-image-picker";
+import * as FileSystem from "expo-file-system/legacy";
 
 const MESES = [
   "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
@@ -20,6 +26,8 @@ const DIAS_SEMANA = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
 
 const STORAGE_KEY_DIAS = "dias-estado";
 const STORAGE_KEY_GASTOS = "gastos-lista";
+
+const unlockKey = "8998";
 
 function claveDia(anio, mes, dia) {
   return `${anio}-${String(mes + 1).padStart(2, "0")}-${String(dia).padStart(2, "0")}`;
@@ -57,8 +65,112 @@ function hoyISO() {
   return `${h.getFullYear()}-${String(h.getMonth() + 1).padStart(2, "0")}-${String(h.getDate()).padStart(2, "0")}`;
 }
 
+// CORREÇÃO 1: Adicionado 'setIsLocked' como dependência no array do useEffect
+function UnlockApp({ isLocked, setIsLocked }) { 
+  const [modalVisivel, setModalVisivel] = useState(false);
+  const [senhaDigitada, setSenhaDigitada] = useState("");
+
+  useEffect(() => {
+    const setLockedStates = async () => {
+      try {
+        const saved = await AsyncStorage.getItem('@app_bloqueado');
+        if (saved !== null) {
+          setIsLocked(JSON.parse(saved));
+        }
+      } catch (e) {
+        console.log("Erro ao carregar estado", e);
+      }
+    };
+    
+    setLockedStates();
+  }, [setIsLocked]);
+
+  const saveLockedState = async (newState) => {
+    try {
+      await AsyncStorage.setItem('@app_bloqueado', JSON.stringify(newState));
+      setIsLocked(newState);
+    } catch (e) {
+      console.log("Erro ao salvar estado", e);
+    }
+  };
+
+  const manageUnlock = () => {
+    if (!isLocked) {
+      saveLockedState(true);
+      Alert.alert("Bloqueado", "O aplicativo foi bloqueado novamente.");
+    } else {
+      setSenhaDigitada("");
+      setModalVisivel(true);
+    }
+  };
+
+  const verificarSenha = () => {
+    if (String(senhaDigitada) === String(unlockKey)) {
+      saveLockedState(false);
+      setModalVisivel(false);
+    } else {
+      Alert.alert("Erro", "Contraseña incorrecta!");
+    }
+  };
+
+  return (
+    <View style={styles.containerLock}>
+      <TouchableOpacity
+        style={[
+          styles.botaoLockCustom,
+          { backgroundColor: isLocked ? "#888888" : "#4CAF50" }
+        ]}
+        onPress={manageUnlock}
+      >
+        <Text style={[styles.botaoLockTextoCustom, { fontSize: 20 }]}>
+          {isLocked ? "🔒" : "🔓"}
+        </Text>
+      </TouchableOpacity>
+
+      <Modal
+        visible={modalVisivel}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setModalVisivel(false)}
+      >
+        <View style={styles.modalLockFundo}>
+          <View style={styles.modalLockCaja}>
+            <Text style={styles.modalLockTitulo}>Digite la contraseña</Text>
+            
+            <TextInput
+              style={styles.modalLockInput}
+              placeholder="Contraseña"
+              secureTextEntry={true}
+              keyboardType="numeric"
+              value={senhaDigitada}
+              onChangeText={(texto) => setSenhaDigitada(texto)}
+            />
+
+            <View style={styles.modalLockBotoes}>
+              <TouchableOpacity 
+                style={[styles.modalLockBtn, { backgroundColor: '#DAD5C4' }]} 
+                onPress={() => setModalVisivel(false)}
+              >
+                <Text style={{ color: '#2B2820', fontWeight: '600' }}>Cancelar</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity 
+                style={[styles.modalLockBtn, { backgroundColor: '#2B2820' }]} 
+                onPress={verificarSenha}
+              >
+                <Text style={{ color: '#F3F1E7', fontWeight: '600' }}>OK</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+    </View>
+  );
+} 
+
 export default function App() {
   const [pestana, setPestana] = useState("calendario");
+  const [isLocked, setIsLocked] = useState(true);
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -67,8 +179,15 @@ export default function App() {
         contentContainerStyle={styles.scrollContent}
         keyboardShouldPersistTaps="handled"
       >
+        <UnlockApp isLocked={isLocked} setIsLocked={setIsLocked} />
+        
         <BarraSuperior pestana={pestana} setPestana={setPestana} />
-        {pestana === "calendario" ? <PanelCalendario /> : <PanelGastos />}
+        
+        {pestana === "calendario" ? (
+          <PanelCalendario isLocked={isLocked} />
+        ) : (
+          <PanelGastos isLocked={isLocked} />
+        )}
       </ScrollView>
     </SafeAreaView>
   );
@@ -106,7 +225,7 @@ function TabBtn({ activo, onPress, texto }) {
 
 /* ---------------- PANEL CALENDARIO ---------------- */
 
-function PanelCalendario() {
+function PanelCalendario({ isLocked }) {
   const hoy = new Date();
   const [anio, setAnio] = useState(hoy.getFullYear());
   const [mes, setMes] = useState(hoy.getMonth());
@@ -157,6 +276,9 @@ function PanelCalendario() {
   };
 
   const alternarDia = (dia) => {
+    if (isLocked) {
+      return;
+    }
     const laborable = esLaborable(anio, mes, dia);
     const clave = claveDia(anio, mes, dia);
     const actual = estados[clave] || (laborable ? "verde" : "neutro");
@@ -382,12 +504,15 @@ const TIPOS = [
   { valor: "pago", etiqueta: "Pagó" }
 ];
 
-function PanelGastos() {
+function PanelGastos({ isLocked }) {
   const [entradas, setEntradas] = useState([]);
   const [tipo, setTipo] = useState("debe");
   const [valor, setValor] = useState("");
   const [dia, setDia] = useState(hoyISO());
   const [nota, setNota] = useState("");
+  const [imagen, setImagen] = useState(null);
+  const [mostrarArchivados, setMostrarArchivados] = useState(false);
+  const [imagenVisible, setImagenVisible] = useState(null);
 
   useEffect(() => {
     (async () => {
@@ -408,6 +533,60 @@ function PanelGastos() {
     }
   }, []);
 
+  const guardarCopiaPermanente = async (uriOriginal) => {
+    try {
+      const carpeta = FileSystem.documentDirectory + "gastos-fotos/";
+      const info = await FileSystem.getInfoAsync(carpeta);
+      if (!info.exists) {
+        await FileSystem.makeDirectoryAsync(carpeta, { intermediates: true });
+      }
+      const nombre = `foto-${Date.now()}.jpg`;
+      const destino = carpeta + nombre;
+      await FileSystem.copyAsync({ from: uriOriginal, to: destino });
+      return destino;
+    } catch (e) {
+      console.error("Error al guardar la foto:", e);
+      return uriOriginal;
+    }
+  };
+
+  const elegirDeGaleria = async () => {
+    const permiso = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!permiso.granted) {
+      Alert.alert("Permiso necesario", "Necesitas dar permiso para acceder a tus fotos.");
+      return;
+    }
+    const resultado = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      quality: 0.6
+    });
+    if (!resultado.canceled && resultado.assets && resultado.assets[0]) {
+      const rutaFinal = await guardarCopiaPermanente(resultado.assets[0].uri);
+      setImagen(rutaFinal);
+    }
+  };
+
+  const tomarFoto = async () => {
+    const permiso = await ImagePicker.requestCameraPermissionsAsync();
+    if (!permiso.granted) {
+      Alert.alert("Permiso necesario", "Necesitas dar permiso para usar la cámara.");
+      return;
+    }
+    const resultado = await ImagePicker.launchCameraAsync({ quality: 0.6 });
+    if (!resultado.canceled && resultado.assets && resultado.assets[0]) {
+      const rutaFinal = await guardarCopiaPermanente(resultado.assets[0].uri);
+      setImagen(rutaFinal);
+    }
+  };
+
+  const elegirImagen = () => {
+    Alert.alert("Añadir foto", "¿De dónde quieres la imagen?", [
+      { text: "Cancelar", style: "cancel" },
+      { text: "Cámara", onPress: tomarFoto },
+      { text: "Galería", onPress: elegirDeGaleria }
+    ]);
+  };
+
   const agregarEntrada = () => {
     const numero = parseFloat(valor);
     if (!dia || isNaN(numero)) return;
@@ -417,19 +596,67 @@ function PanelGastos() {
       tipo,
       valor: numero,
       dia,
-      nota: nota.trim()
+      nota: nota.trim(),
+      imagen: imagen || null,
+      archivado: false
     };
     const lista = [nueva, ...entradas].sort((a, b) => (a.dia < b.dia ? 1 : -1));
     setEntradas(lista);
     guardar(lista);
     setValor("");
     setNota("");
+    setImagen(null);
+  };
+
+  const alternarArchivado = (id) => {
+    const lista = entradas.map((e) =>
+      e.id === id ? { ...e, archivado: !e.archivado } : e
+    );
+    setEntradas(lista);
+    guardar(lista);
+  };
+
+  const archivarTodo = () => {
+    const lista = entradas.map((e) => ({ ...e, archivado: true }));
+    setEntradas(lista);
+    guardar(lista);
   };
 
   const eliminarEntrada = (id) => {
-    const lista = entradas.filter((e) => e.id !== id);
-    setEntradas(lista);
-    guardar(lista);
+    Alert.alert(
+      "Eliminar entrada",
+      "¿Seguro que quieres eliminar esta entrada? No se puede deshacer.",
+      [
+        { text: "Cancelar", style: "cancel" },
+        {
+          text: "Eliminar",
+          style: "destructive",
+          onPress: () => {
+            const lista = entradas.filter((e) => e.id !== id);
+            setEntradas(lista);
+            guardar(lista);
+          }
+        }
+      ]
+    );
+  };
+
+  const eliminarTodo = () => {
+    Alert.alert(
+      "Eliminar todo",
+      "¿Seguro que quieres eliminar todas las entradas? Esta acción no se puede deshacer.",
+      [
+        { text: "Cancelar", style: "cancel" },
+        {
+          text: "Eliminar todo",
+          style: "destructive",
+          onPress: () => {
+            setEntradas([]);
+            guardar([]);
+          }
+        }
+      ]
+    );
   };
 
   const totalDebido = useMemo(() => {
@@ -449,88 +676,155 @@ function PanelGastos() {
 
   const colorTotal = totalDebido > 0 ? "#A83B32" : totalDebido < 0 ? "#3F6B4F" : "#5C5745";
   const textoTotal = totalDebido > 0
-    ? `Me debe ${formatoMoneda(totalDebido)}`
+    ? `Blue dot debe ${formatoMoneda(totalDebido)}`
     : totalDebido < 0
-      ? formatoMoneda(totalDebido)
+      ? `Yo debo ${formatoMoneda(totalDebido)}`
       : "Todo saldado";
+
+  // CORREÇÃO 2: Removida a dependência 'vacaciones' (mantendo apenas o entradas)
+  const entradasVisibles = useMemo(() => {
+    return entradas.filter((e) => mostrarArchivados || !e.archivado);
+  }, [entradas, mostrarArchivados]);
+
+  const hayArchivados = useMemo(() => {
+    return entradas.some((e) => e.archivado);
+  }, [entradas]);
 
   return (
     <View>
       <Text style={styles.tituloGastos}>Gastos y pagos</Text>
 
-      <View style={styles.formCaja}>
-        <View style={styles.formFila}>
-          <Campo etiqueta="Persona">
-            <View style={[styles.input, styles.inputBloqueado]}>
-              <Text style={{ color: "#5C5745" }}>{CUENTA}</Text>
-            </View>
+      {!isLocked && (
+        <View style={styles.formCaja}>
+          <View style={styles.formFila}>
+            <Campo etiqueta="Persona">
+              <View style={[styles.input, styles.inputBloqueado]}>
+                <Text style={{ color: "#5C5745" }}>{CUENTA}</Text>
+              </View>
+            </Campo>
+            <Campo etiqueta="Pagó / Debe">
+              <View style={styles.toggleFila}>
+                {TIPOS.map((t) => (
+                  <TouchableOpacity
+                    key={t.valor}
+                    onPress={() => setTipo(t.valor)}
+                    style={[styles.toggleBtn, tipo === t.valor && styles.toggleBtnActivo]}
+                  >
+                    <Text style={[styles.toggleTexto, tipo === t.valor && styles.toggleTextoActivo]}>
+                      {t.etiqueta}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </Campo>
+          </View>
+
+          <View style={styles.formFila}>
+            <Campo etiqueta="Valor (COP)">
+              <TextInput
+                value={valor}
+                onChangeText={setValor}
+                placeholder="0"
+                keyboardType="numeric"
+                style={styles.input}
+              />
+            </Campo>
+            <Campo etiqueta="Fecha (AAAA-MM-DD)">
+              <TextInput
+                value={dia}
+                onChangeText={setDia}
+                placeholder="2026-07-15"
+                style={styles.input}
+              />
+            </Campo>
+          </View>
+
+          <Campo etiqueta="Nota (opcional)">
+            <TextInput
+              value={nota}
+              onChangeText={setNota}
+              placeholder="p. ej. supermercado"
+              style={styles.input}
+            />
           </Campo>
-          <Campo etiqueta="Pagó / Debe">
-            <View style={styles.toggleFila}>
-              {TIPOS.map((t) => (
-                <TouchableOpacity
-                  key={t.valor}
-                  onPress={() => setTipo(t.valor)}
-                  style={[styles.toggleBtn, tipo === t.valor && styles.toggleBtnActivo]}
-                >
-                  <Text style={[styles.toggleTexto, tipo === t.valor && styles.toggleTextoActivo]}>
-                    {t.etiqueta}
-                  </Text>
+
+          <View style={styles.campo}>
+            <Text style={styles.campoEtiqueta}>Foto (opcional)</Text>
+            {imagen ? (
+              <View style={styles.previaFotoFila}>
+                <Image source={{ uri: imagen }} style={styles.previaFoto} />
+                <TouchableOpacity onPress={() => setImagen(null)} style={styles.botonQuitarFoto}>
+                  <Text style={styles.botonQuitarFotoTexto}>Eliminar</Text>
                 </TouchableOpacity>
-              ))}
-            </View>
-          </Campo>
+              </View>
+            ) : (
+              <TouchableOpacity onPress={elegirImagen} style={styles.botonFoto}>
+                <Text style={styles.botonFotoTexto}>📎 Añadir foto</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+
+          <TouchableOpacity onPress={agregarEntrada} style={styles.botonAgregar}>
+            <Text style={styles.botonAgregarTexto}>+ Añadir entrada</Text>
+          </TouchableOpacity>
         </View>
-
-        <View style={styles.formFila}>
-          <Campo etiqueta="Valor (COP)">
-            <TextInput
-              value={valor}
-              onChangeText={setValor}
-              placeholder="0"
-              keyboardType="numeric"
-              style={styles.input}
-            />
-          </Campo>
-          <Campo etiqueta="Fecha (AAAA-MM-DD)">
-            <TextInput
-              value={dia}
-              onChangeText={setDia}
-              placeholder="2026-07-15"
-              style={styles.input}
-            />
-          </Campo>
-        </View>
-
-        <Campo etiqueta="Nota (opcional)">
-          <TextInput
-            value={nota}
-            onChangeText={setNota}
-            placeholder="p. ej. supermercado"
-            style={styles.input}
-          />
-        </Campo>
-
-        <TouchableOpacity onPress={agregarEntrada} style={styles.botonAgregar}>
-          <Text style={styles.botonAgregarTexto}>+ Añadir entrada</Text>
-        </TouchableOpacity>
-      </View>
+      )}
 
       <View style={[styles.totalCaja, { borderColor: colorTotal }]}>
         <Text style={styles.totalEtiqueta}>Total</Text>
         <Text style={[styles.totalValor, { color: colorTotal }]}>{textoTotal}</Text>
       </View>
 
+      {hayArchivados && (
+        <View style={[styles.filaAcciones, { marginBottom: 10 }]}>
+          <TouchableOpacity
+            onPress={() => setMostrarArchivados((v) => !v)}
+            style={styles.botonAccionSecundario}
+          >
+            <Text style={styles.botonAccionSecundarioTexto}>
+              {mostrarArchivados ? "Ocultar archivados" : "Ver archivados"}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      )}
+
+      {!isLocked && (
+        <View style={styles.filaAcciones}>
+          <TouchableOpacity
+            onPress={archivarTodo}
+            style={styles.botonAccionSecundario}
+            disabled={entradas.length === 0}
+          >
+            <Text style={styles.botonAccionSecundarioTexto}>Archivar todo</Text>
+          </TouchableOpacity>
+          
+          <TouchableOpacity
+            onPress={eliminarTodo}
+            style={styles.botonAccionPeligro}
+            disabled={entradas.length === 0}
+          >
+            <Text style={styles.botonAccionPeligroTexto}>Eliminar todo</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+
       <View style={styles.listaGastos}>
-        {entradas.length === 0 ? (
-          <Text style={styles.listaVacia}>Todavía no hay entradas. Añade la primera arriba.</Text>
+        {entradasVisibles.length === 0 ? (
+          <Text style={styles.listaVacia}>
+            {entradas.length === 0
+              ? "Todavía no hay entradas. Añade la primera arriba."
+              : "No hay entradas para mostrar."}
+          </Text>
         ) : (
-          entradas.map((e, i) => (
-            <View
+          entradasVisibles.map((e, i) => (
+            <TouchableOpacity
               key={e.id}
+              activeOpacity={e.imagen ? 0.6 : 1}
+              onPress={() => e.imagen && setImagenVisible(e.imagen)}
               style={[
                 styles.filaGasto,
-                i < entradas.length - 1 && styles.filaGastoBorde
+                i < entradasVisibles.length - 1 && styles.filaGastoBorde,
+                e.archivado && styles.filaGastoArchivada
               ]}
             >
               <View style={styles.filaGastoTop}>
@@ -542,19 +836,55 @@ function PanelGastos() {
                     <Text style={styles.badgeTexto}>{e.tipo === "debe" ? "DEBE" : "PAGÓ"}</Text>
                   </View>
                   <Text style={styles.filaGastoFecha}>{e.dia}</Text>
+                  {!!e.imagen && <Text style={styles.iconoFoto}>📷</Text>}
+                  {e.archivado && <Text style={styles.etiquetaArchivado}>Archivado</Text>}
                 </View>
                 <View style={styles.filaGastoDer}>
                   <Text style={styles.filaGastoValor}>{formatoMoneda(e.valor)}</Text>
-                  <TouchableOpacity onPress={() => eliminarEntrada(e.id)} style={styles.botonEliminar}>
-                    <Text style={{ color: "#B33F3F", fontSize: 16 }}>×</Text>
-                  </TouchableOpacity>
+                  {!isLocked && (
+                    <>
+                      <TouchableOpacity onPress={() => alternarArchivado(e.id)} style={styles.botonEliminar}>
+                        <Text style={{ color: "#7A7461", fontSize: 13 }}>
+                          {e.archivado ? "↺" : "🗄"}
+                        </Text>
+                      </TouchableOpacity>
+                      
+                      <TouchableOpacity onPress={() => eliminarEntrada(e.id)} style={styles.botonEliminar}>
+                        <Text style={{ color: "#B33F3F", fontSize: 16 }}>×</Text>
+                      </TouchableOpacity>
+                    </>
+                  )}
                 </View>
               </View>
               {!!e.nota && <Text style={styles.filaGastoNota} numberOfLines={2}>{e.nota}</Text>}
-            </View>
+            </TouchableOpacity>
           ))
         )}
       </View>
+
+      <Modal
+        visible={!!imagenVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setImagenVisible(null)}
+      >
+        <TouchableOpacity
+          style={styles.modalFondo}
+          activeOpacity={1}
+          onPress={() => setImagenVisible(null)}
+        >
+          {!!imagenVisible && (
+            <Image
+              source={{ uri: imagenVisible }}
+              style={styles.modalImagen}
+              resizeMode="contain"
+            />
+          )}
+          <TouchableOpacity onPress={() => setImagenVisible(null)} style={styles.modalCerrarBtn}>
+            <Text style={styles.modalCerrarTexto}>Cerrar</Text>
+          </TouchableOpacity>
+        </TouchableOpacity>
+      </Modal>
     </View>
   );
 }
@@ -801,7 +1131,7 @@ const styles = StyleSheet.create({
 
   filaGasto: { padding: 10 },
   filaGastoBorde: { borderBottomWidth: 1, borderBottomColor: "#ECE7D8" },
-  filaGastoTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  filaGastoTop: { flexDirection: "row", alignItems: "center", justifyValue: "space-between" },
   filaGastoIzq: { flexDirection: "row", alignItems: "center", gap: 6 },
   filaGastoDer: { flexDirection: "row", alignItems: "center", gap: 8 },
   badge: { paddingHorizontal: 7, paddingVertical: 2, borderRadius: 20 },
@@ -809,5 +1139,149 @@ const styles = StyleSheet.create({
   filaGastoFecha: { fontSize: 11.5, color: "#9B9581" },
   filaGastoValor: { fontSize: 13.5, fontWeight: "700", color: "#2B2820" },
   botonEliminar: { padding: 4 },
-  filaGastoNota: { fontSize: 11.5, color: "#5C5745", marginTop: 4, lineHeight: 16 }
+  filaGastoNota: { fontSize: 11.5, color: "#5C5745", marginTop: 4, lineHeight: 16 },
+
+  filaAcciones: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginBottom: 12 },
+  botonAccionSecundario: {
+    paddingVertical: 7,
+    paddingHorizontal: 10,
+    borderRadius: 7,
+    borderWidth: 1,
+    borderColor: "#DAD5C4",
+    backgroundColor: "#F7F4EA"
+  },
+  botonAccionSecundarioTexto: { fontSize: 11.5, color: "#5C5745", fontWeight: "600" },
+  botonAccionPeligro: {
+    paddingVertical: 7,
+    paddingHorizontal: 10,
+    borderRadius: 7,
+    borderWidth: 1,
+    borderColor: "#E3B8B2",
+    backgroundColor: "#FBEDEB"
+  },
+  botonAccionPeligroTexto: { fontSize: 11.5, color: "#A83B32", fontWeight: "600" },
+
+  filaGastoArchivada: { opacity: 0.55 },
+  etiquetaArchivado: {
+    fontSize: 10,
+    color: "#9B9581",
+    fontStyle: "italic",
+    marginLeft: 4
+  },
+
+  botonFoto: {
+    borderWidth: 1,
+    borderColor: "#DAD5C4",
+    borderRadius: 7,
+    backgroundColor: "#FFFFFF",
+    paddingVertical: 9,
+    alignItems: "center"
+  },
+  botonFotoTexto: { fontSize: 12.5, color: "#5C5745", fontWeight: "600" },
+  previaFotoFila: { flexDirection: "row", alignItems: "center", gap: 10 },
+  previaFoto: {
+    width: 56,
+    height: 56,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#DAD5C4"
+  },
+  botonQuitarFoto: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 7,
+    borderWidth: 1,
+    borderColor: "#E3B8B2",
+    backgroundColor: "#FBEDEB"
+  },
+  botonQuitarFotoTexto: { fontSize: 11.5, color: "#A83B32", fontWeight: "600" },
+
+  iconoFoto: { fontSize: 12, marginLeft: 2 },
+
+  modalFondo: {
+    flex: 1,
+    backgroundColor: "rgba(20,18,12,0.92)",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 24
+  },
+  modalImagen: { width: "100%", height: "75%" },
+  modalCerrarBtn: {
+    marginTop: 18,
+    paddingVertical: 10,
+    paddingHorizontal: 20,
+    borderRadius: 8,
+    backgroundColor: "#F3F1E7"
+  },
+  modalCerrarTexto: { color: "#2B2820", fontWeight: "700", fontSize: 13 },
+  containerLock: {
+    alignItems: 'center',
+    marginVertical: 10,
+  },
+  areaBotao: {
+    width: 150,
+  },
+  modalLockFundo: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.6)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  modalLockCaja: {
+    width: 280,
+    backgroundColor: '#F7F4EA',
+    borderRadius: 12,
+    padding: 20,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#DAD5C4',
+  },
+  modalLockTitulo: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#2B2820',
+    marginBottom: 15,
+  },
+  modalLockInput: {
+    width: '100%',
+    height: 45,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#DAD5C4',
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    textAlign: 'center',
+    fontSize: 16,
+    color: '#2B2820',
+    marginBottom: 20,
+  },
+  modalLockBotoes: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  modalLockBtn: {
+    flex: 1,
+    height: 40,
+    borderRadius: 6,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  botaoLockCustom: {
+    width: 45,
+    height: 40,
+    borderRadius: 8,
+    justifyContent: 'center',
+    alignItems: 'center',
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.2,
+    shadowRadius: 1.41,
+  },
+  botaoLockTextoCustom: {
+    color: '#F3F1E7',
+    fontWeight: '700',
+    fontSize: 14,
+    letterSpacing: 0.5,
+  }
 });
