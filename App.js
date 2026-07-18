@@ -17,15 +17,14 @@ import { StatusBar } from "expo-status-bar";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as ImagePicker from "expo-image-picker";
 import * as FileSystem from "expo-file-system/legacy";
+import { supabase } from "./supabaseClient";
+import { decode } from "base64-arraybuffer";
 
 const MESES = [
   "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
   "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"
 ];
 const DIAS_SEMANA = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
-
-const STORAGE_KEY_DIAS = "dias-estado";
-const STORAGE_KEY_GASTOS = "gastos-lista";
 
 const unlockKey = "8998";
 
@@ -234,48 +233,74 @@ function PanelCalendario({ isLocked }) {
   const [vacaciones, setVacaciones] = useState(34);
 
   useEffect(() => {
+    let activo = true;
     (async () => {
       try {
-        const valor = await AsyncStorage.getItem(STORAGE_KEY_DIAS);
-        if (valor) setEstados(JSON.parse(valor));
+        const { data, error } = await supabase.from("dias_estado").select("clave, estado");
+        if (error) throw error;
+        if (activo && data) {
+          const mapa = {};
+          data.forEach((fila) => { mapa[fila.clave] = fila.estado; });
+          setEstados(mapa);
+        }
       } catch (e) {
-        // sin datos todavía
+        console.error("Error al cargar días:", e);
       } finally {
-        setCargado(true);
+        if (activo) setCargado(true);
       }
     })();
+
+    // Sincronización en tiempo real entre dispositivos
+    const canal = supabase
+      .channel("dias_estado_cambios")
+      .on("postgres_changes", { event: "*", schema: "public", table: "dias_estado" }, (payload) => {
+        setEstados((prev) => {
+          const copia = { ...prev };
+          if (payload.eventType === "DELETE") {
+            delete copia[payload.old.clave];
+          } else {
+            copia[payload.new.clave] = payload.new.estado;
+          }
+          return copia;
+        });
+      })
+      .subscribe();
+
+    return () => {
+      activo = false;
+      supabase.removeChannel(canal);
+    };
   }, []);
 
   useEffect(() => {
+    let activo = true;
     (async () => {
       try {
-        const valor = await AsyncStorage.getItem(`vacaciones-${anio}`);
-        setVacaciones(valor !== null ? Number(valor) : 34);
+        const { data, error } = await supabase
+          .from("vacaciones")
+          .select("valor")
+          .eq("anio", anio)
+          .maybeSingle();
+        if (error) throw error;
+        if (activo) setVacaciones(data ? data.valor : 34);
       } catch (e) {
-        setVacaciones(34);
+        if (activo) setVacaciones(34);
       }
     })();
+    return () => { activo = false; };
   }, [anio]);
-
-  const guardarEstados = useCallback(async (nuevo) => {
-    try {
-      await AsyncStorage.setItem(STORAGE_KEY_DIAS, JSON.stringify(nuevo));
-    } catch (e) {
-      console.error("Error al guardar:", e);
-    }
-  }, []);
 
   const cambiarVacaciones = async (texto) => {
     const numero = texto === "" ? 0 : Number(texto.replace(/[^0-9]/g, ""));
     setVacaciones(numero);
     try {
-      await AsyncStorage.setItem(`vacaciones-${anio}`, String(numero));
+      await supabase.from("vacaciones").upsert({ anio, valor: numero });
     } catch (e) {
       console.error("Error al guardar vacaciones:", e);
     }
   };
 
-  const alternarDia = (dia) => {
+  const alternarDia = async (dia) => {
     if (isLocked) {
       return;
     }
@@ -292,7 +317,16 @@ function PanelCalendario({ isLocked }) {
       nuevo[clave] = siguiente;
     }
     setEstados(nuevo);
-    guardarEstados(nuevo);
+
+    try {
+      if (siguiente === porDefecto) {
+        await supabase.from("dias_estado").delete().eq("clave", clave);
+      } else {
+        await supabase.from("dias_estado").upsert({ clave, estado: siguiente });
+      }
+    } catch (e) {
+      console.error("Error al guardar:", e);
+    }
   };
 
   const rejilla = useMemo(() => {
@@ -514,36 +548,47 @@ function PanelGastos({ isLocked }) {
   const [mostrarArchivados, setMostrarArchivados] = useState(false);
   const [imagenVisible, setImagenVisible] = useState(null);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const guardado = await AsyncStorage.getItem(STORAGE_KEY_GASTOS);
-        if (guardado) setEntradas(JSON.parse(guardado));
-      } catch (e) {
-        // sin datos todavía
-      }
-    })();
-  }, []);
-
-  const guardar = useCallback(async (nuevaLista) => {
+  const cargarEntradas = useCallback(async () => {
     try {
-      await AsyncStorage.setItem(STORAGE_KEY_GASTOS, JSON.stringify(nuevaLista));
+      const { data, error } = await supabase
+        .from("gastos")
+        .select("*")
+        .order("dia", { ascending: false });
+      if (error) throw error;
+      if (data) setEntradas(data);
     } catch (e) {
-      console.error("Error al guardar:", e);
+      console.error("Error al cargar gastos:", e);
     }
   }, []);
 
+  useEffect(() => {
+    cargarEntradas();
+
+    // Sincronización en tiempo real entre dispositivos
+    const canal = supabase
+      .channel("gastos_cambios")
+      .on("postgres_changes", { event: "*", schema: "public", table: "gastos" }, () => {
+        cargarEntradas();
+      })
+      .subscribe();
+
+    return () => supabase.removeChannel(canal);
+  }, [cargarEntradas]);
+
+  // Sube la foto al bucket de Supabase Storage y devuelve la URL pública,
+  // para que todos los usuarios puedan verla (no solo el dispositivo que la tomó).
   const guardarCopiaPermanente = async (uriOriginal) => {
     try {
-      const carpeta = FileSystem.documentDirectory + "gastos-fotos/";
-      const info = await FileSystem.getInfoAsync(carpeta);
-      if (!info.exists) {
-        await FileSystem.makeDirectoryAsync(carpeta, { intermediates: true });
-      }
-      const nombre = `foto-${Date.now()}.jpg`;
-      const destino = carpeta + nombre;
-      await FileSystem.copyAsync({ from: uriOriginal, to: destino });
-      return destino;
+      const base64 = await FileSystem.readAsStringAsync(uriOriginal, {
+        encoding: FileSystem.EncodingType.Base64
+      });
+      const nombre = `foto-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.jpg`;
+      const { error } = await supabase.storage
+        .from("fotos")
+        .upload(nombre, decode(base64), { contentType: "image/jpeg" });
+      if (error) throw error;
+      const { data } = supabase.storage.from("fotos").getPublicUrl(nombre);
+      return data.publicUrl;
     } catch (e) {
       console.error("Error al guardar la foto:", e);
       return uriOriginal;
@@ -587,7 +632,7 @@ function PanelGastos({ isLocked }) {
     ]);
   };
 
-  const agregarEntrada = () => {
+  const agregarEntrada = async () => {
     const numero = parseFloat(valor);
     if (!dia || isNaN(numero)) return;
     const nueva = {
@@ -600,26 +645,37 @@ function PanelGastos({ isLocked }) {
       imagen: imagen || null,
       archivado: false
     };
-    const lista = [nueva, ...entradas].sort((a, b) => (a.dia < b.dia ? 1 : -1));
-    setEntradas(lista);
-    guardar(lista);
+    setEntradas((prev) => [nueva, ...prev].sort((a, b) => (a.dia < b.dia ? 1 : -1)));
     setValor("");
     setNota("");
     setImagen(null);
+    try {
+      const { error } = await supabase.from("gastos").insert(nueva);
+      if (error) throw error;
+    } catch (e) {
+      console.error("Error al guardar:", e);
+    }
   };
 
-  const alternarArchivado = (id) => {
-    const lista = entradas.map((e) =>
-      e.id === id ? { ...e, archivado: !e.archivado } : e
-    );
-    setEntradas(lista);
-    guardar(lista);
+  const alternarArchivado = async (id) => {
+    const entrada = entradas.find((e) => e.id === id);
+    if (!entrada) return;
+    const nuevoValor = !entrada.archivado;
+    setEntradas((prev) => prev.map((e) => (e.id === id ? { ...e, archivado: nuevoValor } : e)));
+    try {
+      await supabase.from("gastos").update({ archivado: nuevoValor }).eq("id", id);
+    } catch (e) {
+      console.error("Error al actualizar:", e);
+    }
   };
 
-  const archivarTodo = () => {
-    const lista = entradas.map((e) => ({ ...e, archivado: true }));
-    setEntradas(lista);
-    guardar(lista);
+  const archivarTodo = async () => {
+    setEntradas((prev) => prev.map((e) => ({ ...e, archivado: true })));
+    try {
+      await supabase.from("gastos").update({ archivado: true }).neq("id", "");
+    } catch (e) {
+      console.error("Error al archivar todo:", e);
+    }
   };
 
   const eliminarEntrada = (id) => {
@@ -631,10 +687,13 @@ function PanelGastos({ isLocked }) {
         {
           text: "Eliminar",
           style: "destructive",
-          onPress: () => {
-            const lista = entradas.filter((e) => e.id !== id);
-            setEntradas(lista);
-            guardar(lista);
+          onPress: async () => {
+            setEntradas((prev) => prev.filter((e) => e.id !== id));
+            try {
+              await supabase.from("gastos").delete().eq("id", id);
+            } catch (e) {
+              console.error("Error al eliminar:", e);
+            }
           }
         }
       ]
@@ -650,9 +709,13 @@ function PanelGastos({ isLocked }) {
         {
           text: "Eliminar todo",
           style: "destructive",
-          onPress: () => {
+          onPress: async () => {
             setEntradas([]);
-            guardar([]);
+            try {
+              await supabase.from("gastos").delete().neq("id", "");
+            } catch (e) {
+              console.error("Error al eliminar todo:", e);
+            }
           }
         }
       ]
