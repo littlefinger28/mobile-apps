@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   SafeAreaView,
   ScrollView,
@@ -11,7 +11,8 @@ import {
   Alert,
   Modal,
   Image,
-  Button
+  Button,
+  PanResponder
 } from "react-native";
 import { StatusBar } from "expo-status-bar";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -347,6 +348,21 @@ function PanelCalendario({ isLocked }) {
     setAnio(nuevoAnio);
   };
 
+  const panResponder = useRef(
+    PanResponder.create({
+      onMoveShouldSetPanResponder: (evt, gestureState) => {
+        return Math.abs(gestureState.dx) > 20 && Math.abs(gestureState.dx) > Math.abs(gestureState.dy) * 2;
+      },
+      onPanResponderRelease: (evt, gestureState) => {
+        if (gestureState.dx <= -50) {
+          cambiarMes(1);
+        } else if (gestureState.dx >= 50) {
+          cambiarMes(-1);
+        }
+      }
+    })
+  ).current;
+
   const conteos = useMemo(() => {
     const c = { verde: 0, naranja: 0, rojo: 0 };
     rejilla.forEach((dia) => {
@@ -400,7 +416,7 @@ function PanelCalendario({ isLocked }) {
     .filter((item) => item.exceso > 0);
 
   return (
-    <View>
+    <View {...panResponder.panHandlers}>
       <View style={styles.navRow}>
         <TouchableOpacity onPress={() => cambiarMes(-1)} style={styles.navBtn}>
           <Text style={styles.navBtnTexto}>‹</Text>
@@ -726,6 +742,7 @@ function PanelGastos({ isLocked }) {
     let debe = 0;
     let pago = 0;
     entradas.forEach((e) => {
+      if (e.archivado) return;
       if (e.tipo === "debe") debe += e.valor;
       else pago += e.valor;
     });
@@ -1194,14 +1211,14 @@ const styles = StyleSheet.create({
 
   filaGasto: { padding: 10 },
   filaGastoBorde: { borderBottomWidth: 1, borderBottomColor: "#ECE7D8" },
-  filaGastoTop: { flexDirection: "row", alignItems: "center", justifyValue: "space-between" },
-  filaGastoIzq: { flexDirection: "row", alignItems: "center", gap: 6 },
-  filaGastoDer: { flexDirection: "row", alignItems: "center", gap: 8 },
+  filaGastoTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  filaGastoIzq: { flexDirection: "row", alignItems: "center", gap: 6, flexShrink: 1, marginRight: 10 },
+  filaGastoDer: { flexDirection: "row", alignItems: "center", gap: 14 },
   badge: { paddingHorizontal: 7, paddingVertical: 2, borderRadius: 20 },
   badgeTexto: { fontSize: 10, fontWeight: "700", color: "#F3F1E7" },
   filaGastoFecha: { fontSize: 11.5, color: "#9B9581" },
-  filaGastoValor: { fontSize: 13.5, fontWeight: "700", color: "#2B2820" },
-  botonEliminar: { padding: 4 },
+  filaGastoValor: { fontSize: 13.5, fontWeight: "700", color: "#2B2820", marginRight: 2 },
+  botonEliminar: { padding: 6 },
   filaGastoNota: { fontSize: 11.5, color: "#5C5745", marginTop: 4, lineHeight: 16 },
 
   filaAcciones: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginBottom: 12 },
@@ -1259,7 +1276,7 @@ const styles = StyleSheet.create({
   },
   botonQuitarFotoTexto: { fontSize: 11.5, color: "#A83B32", fontWeight: "600" },
 
-  iconoFoto: { fontSize: 12, marginLeft: 2 },
+  iconoFoto: { fontSize: 12, marginLeft: 4, marginRight: 2 },
 
   modalFondo: {
     flex: 1,
