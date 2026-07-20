@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "calendario-gastos",
-    "slug": "snack-a2204371-3837-44fd-b309-400bac7bcee0",
+    "name": "pratico",
+    "slug": "jair-pratico",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -22,13 +22,13 @@
       },
       "edgeToEdgeEnabled": true,
       "permissions": [],
-      "package": "com.littlefinger28.jairCalendGastos"
+      "package": "com.littlefinger28.jairPratico"
     },
     "web": {
       "favicon": "./assets/favicon.png",
       "manifest": {
-        "name": "Calendario Gastos",
-        "short_name": "Calendario",
+        "name": "Pratico",
+        "short_name": "Pratico",
         "start_url": ".",
         "display": "standalone",
         "background_color": "#ffffff",
@@ -39,8 +39,9 @@
     "description": "Jair, apontar os dias de trabajo y despesas",
     "extra": {
       "eas": {
-        "projectId": "cdcaa810-fd69-4af3-9832-8e3ee3b6ad4d"
+        "projectId": "dbbc7d09-8ea4-4c8b-a641-3679fc5311ef"
       }
-    }
+    },
+    "owner": "littlefinger28"
   }
 }

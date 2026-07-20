@@ -18,8 +18,6 @@ import { StatusBar } from "expo-status-bar";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as ImagePicker from "expo-image-picker";
 import * as FileSystem from "expo-file-system/legacy";
-import { supabase } from "./supabaseClient";
-import { decode } from "base64-arraybuffer";
 
 const MESES = [
   "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
@@ -38,18 +36,68 @@ function esLaborable(anio, mes, dia) {
   return d !== 0 && d !== 6;
 }
 
-// Sube una foto al bucket de Supabase Storage y devuelve la URL pública.
-async function subirFotoStorage(uriOriginal) {
-  const base64 = await FileSystem.readAsStringAsync(uriOriginal, {
-    encoding: FileSystem.EncodingType.Base64
-  });
-  const nombre = `foto-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.jpg`;
-  const { error } = await supabase.storage
-    .from("fotos")
-    .upload(nombre, decode(base64), { contentType: "image/jpeg" });
-  if (error) throw error;
-  const { data } = supabase.storage.from("fotos").getPublicUrl(nombre);
-  return data.publicUrl;
+// ---------------- ALMACENAMIENTO LOCAL (AsyncStorage + sistema de archivos) ----------------
+// Todos los datos se guardan únicamente en este dispositivo. No hay conexión a internet
+// ni sincronización entre dispositivos.
+
+const KEY_SUELDO = "@sueldo_base";
+const KEY_DIAS_ESTADO = "@dias_estado";
+const KEY_DIAS_FOTOS = "@dias_fotos";
+const KEY_VACACIONES = "@vacaciones";
+const KEY_GASTOS = "@gastos";
+
+async function leerJSON(clave, valorDefecto) {
+  try {
+    const bruto = await AsyncStorage.getItem(clave);
+    return bruto !== null ? JSON.parse(bruto) : valorDefecto;
+  } catch (e) {
+    console.error(`Error al leer ${clave}:`, e);
+    return valorDefecto;
+  }
+}
+
+async function guardarJSON(clave, valor) {
+  try {
+    await AsyncStorage.setItem(clave, JSON.stringify(valor));
+  } catch (e) {
+    console.error(`Error al guardar ${clave}:`, e);
+  }
+}
+
+// Carpeta permanente dentro del propio dispositivo donde se guardan las fotos.
+const CARPETA_FOTOS = FileSystem.documentDirectory + "fotos/";
+
+async function garantizarCarpetaFotos() {
+  const info = await FileSystem.getInfoAsync(CARPETA_FOTOS);
+  if (!info.exists) {
+    await FileSystem.makeDirectoryAsync(CARPETA_FOTOS, { intermediates: true });
+  }
+}
+
+// Copia la foto elegida (cámara o galería) a la carpeta de la app y devuelve
+// la ruta local (file://...) que queda guardada para siempre en el teléfono.
+async function guardarFotoLocal(uriOriginal) {
+  try {
+    await garantizarCarpetaFotos();
+    const nombre = `foto-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.jpg`;
+    const destino = CARPETA_FOTOS + nombre;
+    await FileSystem.copyAsync({ from: uriOriginal, to: destino });
+    return destino;
+  } catch (e) {
+    console.error("Error al guardar la foto localmente:", e);
+    return uriOriginal;
+  }
+}
+
+// Intenta borrar el archivo físico de una foto (si falla, no pasa nada grave).
+async function borrarFotoLocal(uri) {
+  try {
+    if (uri && uri.startsWith(FileSystem.documentDirectory)) {
+      await FileSystem.deleteAsync(uri, { idempotent: true });
+    }
+  } catch (e) {
+    console.error("Error al borrar el archivo de la foto:", e);
+  }
 }
 
 const SUELDO_BASE = 189928;
@@ -215,42 +263,17 @@ export default function App() {
   useEffect(() => {
     let activo = true;
     (async () => {
-      try {
-        const { data, error } = await supabase
-          .from("sueldo_base")
-          .select("valor")
-          .eq("id", 1)
-          .maybeSingle();
-        if (error) throw error;
-        if (activo && data) setSueldoBase(data.valor);
-      } catch (e) {
-        console.error("Error al cargar el sueldo base:", e);
-      }
+      const valor = await leerJSON(KEY_SUELDO, SUELDO_BASE);
+      if (activo) setSueldoBase(valor);
     })();
-
-    const canal = supabase
-      .channel("sueldo_base_cambios")
-      .on("postgres_changes", { event: "*", schema: "public", table: "sueldo_base" }, (payload) => {
-        if (payload.new && typeof payload.new.valor !== "undefined") {
-          setSueldoBase(payload.new.valor);
-        }
-      })
-      .subscribe();
-
     return () => {
       activo = false;
-      supabase.removeChannel(canal);
     };
   }, []);
 
   const cambiarSueldoBase = async (nuevoValor) => {
     setSueldoBase(nuevoValor);
-    try {
-      const { error } = await supabase.from("sueldo_base").upsert({ id: 1, valor: nuevoValor });
-      if (error) throw error;
-    } catch (e) {
-      console.error("Error al guardar el sueldo base:", e);
-    }
+    await guardarJSON(KEY_SUELDO, nuevoValor);
   };
 
   return (
@@ -325,37 +348,15 @@ function PanelCalendario({ isLocked, sueldoBase, onCambiarSueldoBase }) {
   useEffect(() => {
     let activo = true;
     (async () => {
-      try {
-        const { data, error } = await supabase.from("dias_fotos").select("clave");
-        if (error) throw error;
-        if (activo && data) {
-          const mapa = {};
-          data.forEach((fila) => { mapa[fila.clave] = (mapa[fila.clave] || 0) + 1; });
-          setClavesConFoto(mapa);
-        }
-      } catch (e) {
-        console.error("Error al cargar fotos de días:", e);
+      const data = await leerJSON(KEY_DIAS_FOTOS, []);
+      if (activo) {
+        const mapa = {};
+        data.forEach((fila) => { mapa[fila.clave] = (mapa[fila.clave] || 0) + 1; });
+        setClavesConFoto(mapa);
       }
     })();
-
-    const canal = supabase
-      .channel("dias_fotos_indicador")
-      .on("postgres_changes", { event: "*", schema: "public", table: "dias_fotos" }, () => {
-        supabase
-          .from("dias_fotos")
-          .select("clave")
-          .then(({ data }) => {
-            if (!activo || !data) return;
-            const mapa = {};
-            data.forEach((fila) => { mapa[fila.clave] = (mapa[fila.clave] || 0) + 1; });
-            setClavesConFoto(mapa);
-          });
-      })
-      .subscribe();
-
     return () => {
       activo = false;
-      supabase.removeChannel(canal);
     };
   }, []);
 
@@ -364,13 +365,11 @@ function PanelCalendario({ isLocked, sueldoBase, onCambiarSueldoBase }) {
     setModalFotosVisible(true);
     setCargandoFotos(true);
     try {
-      const { data, error } = await supabase
-        .from("dias_fotos")
-        .select("*")
-        .eq("clave", clave)
-        .order("creado_en", { ascending: false });
-      if (error) throw error;
-      setFotosDelDia(data || []);
+      const todas = await leerJSON(KEY_DIAS_FOTOS, []);
+      const delDia = todas
+        .filter((f) => f.clave === clave)
+        .sort((a, b) => (b.creado_en || 0) - (a.creado_en || 0));
+      setFotosDelDia(delDia);
     } catch (e) {
       console.error("Error al cargar fotos del día:", e);
       setFotosDelDia([]);
@@ -405,16 +404,17 @@ function PanelCalendario({ isLocked, sueldoBase, onCambiarSueldoBase }) {
 
     setSubiendoFoto(true);
     try {
-      const url = await subirFotoStorage(resultado.assets[0].uri);
+      const rutaLocal = await guardarFotoLocal(resultado.assets[0].uri);
       const nuevaFila = {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
         clave: diaFotosClave,
-        foto: url
+        foto: rutaLocal,
+        creado_en: Date.now()
       };
       setFotosDelDia((prev) => [nuevaFila, ...prev]);
       setClavesConFoto((prev) => ({ ...prev, [diaFotosClave]: (prev[diaFotosClave] || 0) + 1 }));
-      const { error } = await supabase.from("dias_fotos").insert(nuevaFila);
-      if (error) throw error;
+      const todas = await leerJSON(KEY_DIAS_FOTOS, []);
+      await guardarJSON(KEY_DIAS_FOTOS, [nuevaFila, ...todas]);
     } catch (e) {
       console.error("Error al añadir foto:", e);
       Alert.alert("Error", "No se pudo añadir la foto.");
@@ -447,8 +447,9 @@ function PanelCalendario({ isLocked, sueldoBase, onCambiarSueldoBase }) {
             return copia;
           });
           try {
-            const { error } = await supabase.from("dias_fotos").delete().eq("id", fila.id);
-            if (error) throw error;
+            await borrarFotoLocal(fila.foto);
+            const todas = await leerJSON(KEY_DIAS_FOTOS, []);
+            await guardarJSON(KEY_DIAS_FOTOS, todas.filter((f) => f.id !== fila.id));
           } catch (e) {
             console.error("Error al eliminar foto:", e);
           }
@@ -460,57 +461,20 @@ function PanelCalendario({ isLocked, sueldoBase, onCambiarSueldoBase }) {
   useEffect(() => {
     let activo = true;
     (async () => {
-      try {
-        const { data, error } = await supabase.from("dias_estado").select("clave, estado");
-        if (error) throw error;
-        if (activo && data) {
-          const mapa = {};
-          data.forEach((fila) => { mapa[fila.clave] = fila.estado; });
-          setEstados(mapa);
-        }
-      } catch (e) {
-        console.error("Error al cargar días:", e);
-      } finally {
-        if (activo) setCargado(true);
-      }
+      const mapa = await leerJSON(KEY_DIAS_ESTADO, {});
+      if (activo) setEstados(mapa);
+      if (activo) setCargado(true);
     })();
-
-    // Sincronización en tiempo real entre dispositivos
-    const canal = supabase
-      .channel("dias_estado_cambios")
-      .on("postgres_changes", { event: "*", schema: "public", table: "dias_estado" }, (payload) => {
-        setEstados((prev) => {
-          const copia = { ...prev };
-          if (payload.eventType === "DELETE") {
-            delete copia[payload.old.clave];
-          } else {
-            copia[payload.new.clave] = payload.new.estado;
-          }
-          return copia;
-        });
-      })
-      .subscribe();
-
     return () => {
       activo = false;
-      supabase.removeChannel(canal);
     };
   }, []);
 
   useEffect(() => {
     let activo = true;
     (async () => {
-      try {
-        const { data, error } = await supabase
-          .from("vacaciones")
-          .select("valor")
-          .eq("anio", anio)
-          .maybeSingle();
-        if (error) throw error;
-        if (activo) setVacaciones(data ? data.valor : 34);
-      } catch (e) {
-        if (activo) setVacaciones(34);
-      }
+      const mapa = await leerJSON(KEY_VACACIONES, {});
+      if (activo) setVacaciones(typeof mapa[anio] === "number" ? mapa[anio] : 34);
     })();
     return () => { activo = false; };
   }, [anio]);
@@ -519,7 +483,9 @@ function PanelCalendario({ isLocked, sueldoBase, onCambiarSueldoBase }) {
     const numero = texto === "" ? 0 : Number(texto.replace(/[^0-9]/g, ""));
     setVacaciones(numero);
     try {
-      await supabase.from("vacaciones").upsert({ anio, valor: numero });
+      const mapa = await leerJSON(KEY_VACACIONES, {});
+      mapa[anio] = numero;
+      await guardarJSON(KEY_VACACIONES, mapa);
     } catch (e) {
       console.error("Error al guardar vacaciones:", e);
     }
@@ -550,11 +516,7 @@ function PanelCalendario({ isLocked, sueldoBase, onCambiarSueldoBase }) {
     setEstados(nuevo);
 
     try {
-      if (siguiente === porDefecto) {
-        await supabase.from("dias_estado").delete().eq("clave", clave);
-      } else {
-        await supabase.from("dias_estado").upsert({ clave, estado: siguiente });
-      }
+      await guardarJSON(KEY_DIAS_ESTADO, nuevo);
     } catch (e) {
       console.error("Error al guardar:", e);
     }
@@ -902,12 +864,8 @@ function PanelGastos({ isLocked, sueldoBase }) {
 
   const cargarEntradas = useCallback(async () => {
     try {
-      const { data, error } = await supabase
-        .from("gastos")
-        .select("*")
-        .order("dia", { ascending: false });
-      if (error) throw error;
-      if (data) setEntradas(data);
+      const data = await leerJSON(KEY_GASTOS, []);
+      setEntradas([...data].sort((a, b) => (a.dia < b.dia ? 1 : -1)));
     } catch (e) {
       console.error("Error al cargar gastos:", e);
     }
@@ -915,36 +873,11 @@ function PanelGastos({ isLocked, sueldoBase }) {
 
   useEffect(() => {
     cargarEntradas();
-
-    // Sincronización en tiempo real entre dispositivos
-    const canal = supabase
-      .channel("gastos_cambios")
-      .on("postgres_changes", { event: "*", schema: "public", table: "gastos" }, () => {
-        cargarEntradas();
-      })
-      .subscribe();
-
-    return () => supabase.removeChannel(canal);
   }, [cargarEntradas]);
 
-  // Sube la foto al bucket de Supabase Storage y devuelve la URL pública,
-  // para que todos los usuarios puedan verla (no solo el dispositivo que la tomó).
+  // Copia la foto a la carpeta de la app para que quede guardada en este dispositivo.
   const guardarCopiaPermanente = async (uriOriginal) => {
-    try {
-      const base64 = await FileSystem.readAsStringAsync(uriOriginal, {
-        encoding: FileSystem.EncodingType.Base64
-      });
-      const nombre = `foto-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.jpg`;
-      const { error } = await supabase.storage
-        .from("fotos")
-        .upload(nombre, decode(base64), { contentType: "image/jpeg" });
-      if (error) throw error;
-      const { data } = supabase.storage.from("fotos").getPublicUrl(nombre);
-      return data.publicUrl;
-    } catch (e) {
-      console.error("Error al guardar la foto:", e);
-      return uriOriginal;
-    }
+    return guardarFotoLocal(uriOriginal);
   };
 
   const elegirDeGaleria = async () => {
@@ -1002,8 +935,8 @@ function PanelGastos({ isLocked, sueldoBase }) {
     setNota("");
     setImagen(null);
     try {
-      const { error } = await supabase.from("gastos").insert(nueva);
-      if (error) throw error;
+      const actuales = await leerJSON(KEY_GASTOS, []);
+      await guardarJSON(KEY_GASTOS, [nueva, ...actuales]);
     } catch (e) {
       console.error("Error al guardar:", e);
     }
@@ -1022,8 +955,8 @@ function PanelGastos({ isLocked, sueldoBase }) {
     };
     setEntradas((prev) => [nueva, ...prev].sort((a, b) => (a.dia < b.dia ? 1 : -1)));
     try {
-      const { error } = await supabase.from("gastos").insert(nueva);
-      if (error) throw error;
+      const actuales = await leerJSON(KEY_GASTOS, []);
+      await guardarJSON(KEY_GASTOS, [nueva, ...actuales]);
     } catch (e) {
       console.error("Error al guardar entrada rápida:", e);
     }
@@ -1034,16 +967,13 @@ function PanelGastos({ isLocked, sueldoBase }) {
     try {
       const anio = anioParaMesElegido(mes);
       const prefijo = `${anio}-${String(mes + 1).padStart(2, "0")}-`;
-      const { data, error } = await supabase
-        .from("dias_estado")
-        .select("clave, estado")
-        .like("clave", `${prefijo}%`);
-      if (error) throw error;
+      const estadosGuardados = await leerJSON(KEY_DIAS_ESTADO, {});
 
       let naranjaCount = 0;
-      (data || []).forEach((fila) => {
-        const dia = parseInt(fila.clave.split("-")[2], 10);
-        if (fila.estado === "naranja" && esLaborable(anio, mes, dia)) {
+      Object.entries(estadosGuardados).forEach(([clave, estado]) => {
+        if (!clave.startsWith(prefijo)) return;
+        const dia = parseInt(clave.split("-")[2], 10);
+        if (estado === "naranja" && esLaborable(anio, mes, dia)) {
           naranjaCount += 1;
         }
       });
@@ -1067,14 +997,8 @@ function PanelGastos({ isLocked, sueldoBase }) {
     setCalculandoRapido(true);
     try {
       const anio = anioParaMesElegido(mes);
-      const { data, error } = await supabase
-        .from("vacaciones")
-        .select("valor")
-        .eq("anio", anio)
-        .maybeSingle();
-      if (error) throw error;
-
-      const diasVacaciones = data ? data.valor : 34;
+      const mapaVacaciones = await leerJSON(KEY_VACACIONES, {});
+      const diasVacaciones = typeof mapaVacaciones[anio] === "number" ? mapaVacaciones[anio] : 34;
       const valorDiario = sueldoBase / 22;
       const valorNumero = Math.round(valorDiario * diasVacaciones);
       const diaISO = hoyISO();
@@ -1112,7 +1036,11 @@ function PanelGastos({ isLocked, sueldoBase }) {
     const nuevoValor = !entrada.archivado;
     setEntradas((prev) => prev.map((e) => (e.id === id ? { ...e, archivado: nuevoValor } : e)));
     try {
-      await supabase.from("gastos").update({ archivado: nuevoValor }).eq("id", id);
+      const actuales = await leerJSON(KEY_GASTOS, []);
+      await guardarJSON(
+        KEY_GASTOS,
+        actuales.map((e) => (e.id === id ? { ...e, archivado: nuevoValor } : e))
+      );
     } catch (e) {
       console.error("Error al actualizar:", e);
     }
@@ -1121,7 +1049,8 @@ function PanelGastos({ isLocked, sueldoBase }) {
   const archivarTodo = async () => {
     setEntradas((prev) => prev.map((e) => ({ ...e, archivado: true })));
     try {
-      await supabase.from("gastos").update({ archivado: true }).neq("id", "");
+      const actuales = await leerJSON(KEY_GASTOS, []);
+      await guardarJSON(KEY_GASTOS, actuales.map((e) => ({ ...e, archivado: true })));
     } catch (e) {
       console.error("Error al archivar todo:", e);
     }
@@ -1139,7 +1068,8 @@ function PanelGastos({ isLocked, sueldoBase }) {
           onPress: async () => {
             setEntradas((prev) => prev.filter((e) => e.id !== id));
             try {
-              await supabase.from("gastos").delete().eq("id", id);
+              const actuales = await leerJSON(KEY_GASTOS, []);
+              await guardarJSON(KEY_GASTOS, actuales.filter((e) => e.id !== id));
             } catch (e) {
               console.error("Error al eliminar:", e);
             }
@@ -1161,7 +1091,7 @@ function PanelGastos({ isLocked, sueldoBase }) {
           onPress: async () => {
             setEntradas([]);
             try {
-              await supabase.from("gastos").delete().neq("id", "");
+              await guardarJSON(KEY_GASTOS, []);
             } catch (e) {
               console.error("Error al eliminar todo:", e);
             }
