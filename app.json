@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "pratico",
-    "slug": "jair-pratico",
+    "name": "contas-partilhadas",
+    "slug": "contas-partilhadas",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -22,26 +22,10 @@
       },
       "edgeToEdgeEnabled": true,
       "permissions": [],
-      "package": "com.littlefinger28.jairPratico"
+      "package": "com.littlefinger28.contasPartilhadas"
     },
     "web": {
-      "favicon": "./assets/favicon.png",
-      "manifest": {
-        "name": "Pratico",
-        "short_name": "Pratico",
-        "start_url": ".",
-        "display": "standalone",
-        "background_color": "#ffffff",
-        "theme_color": "#ffffff",
-        "description": "Jair, apontar os dias de trabalho e despesas"
-      }
-    },
-    "description": "Jair, apontar os dias de trabajo y despesas",
-    "extra": {
-      "eas": {
-        "projectId": "dbbc7d09-8ea4-4c8b-a641-3679fc5311ef"
-      }
-    },
-    "owner": "littlefinger28"
+      "favicon": "./assets/favicon.png"
+    }
   }
 }

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import React, { useState, useEffect, useCallback, useMemo } from "react";
 import {
   SafeAreaView,
   ScrollView,
@@ -10,1860 +10,1133 @@ import {
   Platform,
   Alert,
   Modal,
-  Image,
-  Button,
-  PanResponder
+  KeyboardAvoidingView
 } from "react-native";
 import { StatusBar } from "expo-status-bar";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import * as ImagePicker from "expo-image-picker";
-import * as FileSystem from "expo-file-system/legacy";
+import { supabase } from "./supabaseClient";
 
-const MESES = [
-  "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
-  "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"
-];
-const DIAS_SEMANA = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
+const DEVICE_ID_KEY = "dispositivo-id";
 
-const unlockKey = "8998";
-
-function claveDia(anio, mes, dia) {
-  return `${anio}-${String(mes + 1).padStart(2, "0")}-${String(dia).padStart(2, "0")}`;
+function gerarId() {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function esLaborable(anio, mes, dia) {
-  const d = new Date(anio, mes, dia).getDay();
-  return d !== 0 && d !== 6;
-}
-
-// ---------------- ALMACENAMIENTO LOCAL (AsyncStorage + sistema de archivos) ----------------
-// Todos los datos se guardan únicamente en este dispositivo. No hay conexión a internet
-// ni sincronización entre dispositivos.
-
-const KEY_SUELDO = "@sueldo_base";
-const KEY_DIAS_ESTADO = "@dias_estado";
-const KEY_DIAS_FOTOS = "@dias_fotos";
-const KEY_VACACIONES = "@vacaciones";
-const KEY_GASTOS = "@gastos";
-
-async function leerJSON(clave, valorDefecto) {
-  try {
-    const bruto = await AsyncStorage.getItem(clave);
-    return bruto !== null ? JSON.parse(bruto) : valorDefecto;
-  } catch (e) {
-    console.error(`Error al leer ${clave}:`, e);
-    return valorDefecto;
+async function obterDeviceId() {
+  let id = await AsyncStorage.getItem(DEVICE_ID_KEY);
+  if (!id) {
+    id = gerarId();
+    await AsyncStorage.setItem(DEVICE_ID_KEY, id);
   }
+  return id;
 }
 
-async function guardarJSON(clave, valor) {
-  try {
-    await AsyncStorage.setItem(clave, JSON.stringify(valor));
-  } catch (e) {
-    console.error(`Error al guardar ${clave}:`, e);
-  }
+function formatoMoeda(valor) {
+  const numero = Number(valor) || 0;
+  const sinal = numero < 0 ? "-" : "";
+  const partes = Math.abs(numero).toFixed(2).split(".");
+  const inteiro = partes[0].replace(/\B(?=(\d{3})+(?!\d))/g, " ");
+  return `${sinal}${inteiro},${partes[1]}€`;
 }
 
-// Carpeta permanente dentro del propio dispositivo donde se guardan las fotos.
-const CARPETA_FOTOS = FileSystem.documentDirectory + "fotos/";
-
-async function garantizarCarpetaFotos() {
-  const info = await FileSystem.getInfoAsync(CARPETA_FOTOS);
-  if (!info.exists) {
-    await FileSystem.makeDirectoryAsync(CARPETA_FOTOS, { intermediates: true });
-  }
+function hojeISO() {
+  const d = new Date();
+  const mes = String(d.getMonth() + 1).padStart(2, "0");
+  const dia = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${mes}-${dia}`;
 }
 
-// Copia la foto elegida (cámara o galería) a la carpeta de la app y devuelve
-// la ruta local (file://...) que queda guardada para siempre en el teléfono.
-async function guardarFotoLocal(uriOriginal) {
-  try {
-    await garantizarCarpetaFotos();
-    const nombre = `foto-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.jpg`;
-    const destino = CARPETA_FOTOS + nombre;
-    await FileSystem.copyAsync({ from: uriOriginal, to: destino });
-    return destino;
-  } catch (e) {
-    console.error("Error al guardar la foto localmente:", e);
-    return uriOriginal;
-  }
-}
+// Algoritmo clássico de simplificação de dívidas: junta os maiores credores
+// com os maiores devedores até saldar tudo, minimizando o nº de transferências.
+function simplificarDividas(saldos) {
+  const credores = [];
+  const devedores = [];
+  Object.entries(saldos).forEach(([id, valor]) => {
+    if (valor > 0.01) credores.push({ id, valor });
+    else if (valor < -0.01) devedores.push({ id, valor: -valor });
+  });
+  credores.sort((a, b) => b.valor - a.valor);
+  devedores.sort((a, b) => b.valor - a.valor);
 
-// Intenta borrar el archivo físico de una foto (si falla, no pasa nada grave).
-async function borrarFotoLocal(uri) {
-  try {
-    if (uri && uri.startsWith(FileSystem.documentDirectory)) {
-      await FileSystem.deleteAsync(uri, { idempotent: true });
+  const transacoes = [];
+  let i = 0;
+  let j = 0;
+  while (i < devedores.length && j < credores.length) {
+    const pagar = Math.min(devedores[i].valor, credores[j].valor);
+    if (pagar > 0.01) {
+      transacoes.push({ de: devedores[i].id, para: credores[j].id, valor: pagar });
     }
-  } catch (e) {
-    console.error("Error al borrar el archivo de la foto:", e);
+    devedores[i].valor -= pagar;
+    credores[j].valor -= pagar;
+    if (devedores[i].valor < 0.01) i += 1;
+    if (credores[j].valor < 0.01) j += 1;
   }
+  return transacoes;
 }
 
-const SUELDO_BASE = 189928;
-
-function diasUtilesDelMes(anio, mes) {
-  const totalDias = new Date(anio, mes + 1, 0).getDate();
-  let cuenta = 0;
-  for (let d = 1; d <= totalDias; d++) {
-    if (esLaborable(anio, mes, d)) cuenta += 1;
-  }
-  return cuenta;
+// Divide um valor total entre N pessoas em partes iguais, distribuindo os
+// cêntimos de resto pelas primeiras pessoas para o total bater sempre certo.
+function dividirIgual(total, participantesIds) {
+  const n = participantesIds.length;
+  if (n === 0) return {};
+  const centavosTotais = Math.round(total * 100);
+  const base = Math.floor(centavosTotais / n);
+  const resto = centavosTotais - base * n;
+  const resultado = {};
+  participantesIds.forEach((id, idx) => {
+    const centavos = base + (idx < resto ? 1 : 0);
+    resultado[id] = centavos / 100;
+  });
+  return resultado;
 }
-
-function ultimoDiaISO(anio, mes) {
-  const totalDias = new Date(anio, mes + 1, 0).getDate();
-  return claveDia(anio, mes, totalDias);
-}
-
-// Si el mes elegido todavía no ha ocurrido este año (es posterior al mes actual),
-// se refiere al mismo mes del año anterior.
-function anioParaMesElegido(mesElegido) {
-  const hoy = new Date();
-  const mesActual = hoy.getMonth();
-  const anioActual = hoy.getFullYear();
-  return mesElegido > mesActual ? anioActual - 1 : anioActual;
-}
-
-function siguienteEstado(actual, laborable) {
-  const ordenLaborable = ["verde", "naranja", "rojo"];
-  const ordenFinde = ["neutro", "verde", "naranja", "rojo"];
-  const orden = laborable ? ordenLaborable : ordenFinde;
-  const idx = orden.indexOf(actual);
-  return orden[(idx + 1) % orden.length];
-}
-
-const ESTADO_LABEL = {
-  verde: "trabajé",
-  naranja: "no trabajé",
-  rojo: "médico",
-  neutro: "sin estado"
-};
-
-const COLORES = {
-  verde: { bg: "#3F6B4F", fg: "#F3F1E7", ring: "#2E4F3A" },
-  naranja: { bg: "#C97A3D", fg: "#F3F1E7", ring: "#9C5A2A" },
-  rojo: { bg: "#A83B32", fg: "#F3F1E7", ring: "#7C2A23" },
-  neutro: { bg: "#F3F1E7", fg: "#3A362C", ring: "#DAD5C4" }
-};
-
-function hoyISO() {
-  const h = new Date();
-  return `${h.getFullYear()}-${String(h.getMonth() + 1).padStart(2, "0")}-${String(h.getDate()).padStart(2, "0")}`;
-}
-
-// CORREÇÃO 1: Adicionado 'setIsLocked' como dependência no array do useEffect
-function UnlockApp({ isLocked, setIsLocked }) { 
-  const [modalVisivel, setModalVisivel] = useState(false);
-  const [senhaDigitada, setSenhaDigitada] = useState("");
-
-  useEffect(() => {
-    const setLockedStates = async () => {
-      try {
-        const saved = await AsyncStorage.getItem('@app_bloqueado');
-        if (saved !== null) {
-          setIsLocked(JSON.parse(saved));
-        }
-      } catch (e) {
-        console.log("Erro ao carregar estado", e);
-      }
-    };
-    
-    setLockedStates();
-  }, [setIsLocked]);
-
-  const saveLockedState = async (newState) => {
-    try {
-      await AsyncStorage.setItem('@app_bloqueado', JSON.stringify(newState));
-      setIsLocked(newState);
-    } catch (e) {
-      console.log("Erro ao salvar estado", e);
-    }
-  };
-
-  const manageUnlock = () => {
-    if (!isLocked) {
-      saveLockedState(true);
-      Alert.alert("Bloqueado", "O aplicativo foi bloqueado novamente.");
-    } else {
-      setSenhaDigitada("");
-      setModalVisivel(true);
-    }
-  };
-
-  const verificarSenha = () => {
-    if (String(senhaDigitada) === String(unlockKey)) {
-      saveLockedState(false);
-      setModalVisivel(false);
-    } else {
-      Alert.alert("Erro", "Contraseña incorrecta!");
-    }
-  };
-
-  return (
-    <View style={styles.containerLock}>
-      <TouchableOpacity
-        style={[
-          styles.botaoLockCustom,
-          { backgroundColor: isLocked ? "#888888" : "#4CAF50" }
-        ]}
-        onPress={manageUnlock}
-      >
-        <Text style={[styles.botaoLockTextoCustom, { fontSize: 20 }]}>
-          {isLocked ? "🔒" : "🔓"}
-        </Text>
-      </TouchableOpacity>
-
-      <Modal
-        visible={modalVisivel}
-        transparent={true}
-        animationType="fade"
-        onRequestClose={() => setModalVisivel(false)}
-      >
-        <View style={styles.modalLockFundo}>
-          <View style={styles.modalLockCaja}>
-            <Text style={styles.modalLockTitulo}>Digite la contraseña</Text>
-            
-            <TextInput
-              style={styles.modalLockInput}
-              placeholder="Contraseña"
-              secureTextEntry={true}
-              keyboardType="numeric"
-              value={senhaDigitada}
-              onChangeText={(texto) => setSenhaDigitada(texto)}
-            />
-
-            <View style={styles.modalLockBotoes}>
-              <TouchableOpacity 
-                style={[styles.modalLockBtn, { backgroundColor: '#DAD5C4' }]} 
-                onPress={() => setModalVisivel(false)}
-              >
-                <Text style={{ color: '#2B2820', fontWeight: '600' }}>Cancelar</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity 
-                style={[styles.modalLockBtn, { backgroundColor: '#2B2820' }]} 
-                onPress={verificarSenha}
-              >
-                <Text style={{ color: '#F3F1E7', fontWeight: '600' }}>OK</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </Modal>
-    </View>
-  );
-} 
 
 export default function App() {
-  const [pestana, setPestana] = useState("calendario");
-  const [isLocked, setIsLocked] = useState(true);
-  const [sueldoBase, setSueldoBase] = useState(SUELDO_BASE);
+  const [deviceId, setDeviceId] = useState(null);
+  const [grupoAberto, setGrupoAberto] = useState(null);
 
   useEffect(() => {
-    let activo = true;
-    (async () => {
-      const valor = await leerJSON(KEY_SUELDO, SUELDO_BASE);
-      if (activo) setSueldoBase(valor);
-    })();
-    return () => {
-      activo = false;
-    };
+    obterDeviceId().then(setDeviceId);
   }, []);
 
-  const cambiarSueldoBase = async (nuevoValor) => {
-    setSueldoBase(nuevoValor);
-    await guardarJSON(KEY_SUELDO, nuevoValor);
-  };
+  if (!deviceId) {
+    return <SafeAreaView style={styles.safe} />;
+  }
 
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar style="dark" />
-      <ScrollView
-        contentContainerStyle={styles.scrollContent}
-        keyboardShouldPersistTaps="handled"
-      >
-        <UnlockApp isLocked={isLocked} setIsLocked={setIsLocked} />
-        
-        <BarraSuperior pestana={pestana} setPestana={setPestana} />
-        
-        {pestana === "calendario" ? (
-          <PanelCalendario isLocked={isLocked} sueldoBase={sueldoBase} onCambiarSueldoBase={cambiarSueldoBase} />
-        ) : (
-          <PanelGastos isLocked={isLocked} sueldoBase={sueldoBase} />
-        )}
-      </ScrollView>
+      {grupoAberto ? (
+        <TelaGrupo
+          grupo={grupoAberto}
+          deviceId={deviceId}
+          onVoltar={() => setGrupoAberto(null)}
+        />
+      ) : (
+        <TelaGrupos deviceId={deviceId} onAbrirGrupo={setGrupoAberto} />
+      )}
     </SafeAreaView>
   );
 }
 
-function BarraSuperior({ pestana, setPestana }) {
+function TelaGrupos({ onAbrirGrupo }) {
+  const [grupos, setGrupos] = useState([]);
+  const [carregado, setCarregado] = useState(false);
+  const [modalVisivel, setModalVisivel] = useState(false);
+  const [nomeNovoGrupo, setNomeNovoGrupo] = useState("");
+
+  const carregarGrupos = useCallback(async () => {
+    try {
+      const { data, error } = await supabase
+        .from("grupos")
+        .select("*")
+        .order("created_at", { ascending: false });
+      if (error) throw error;
+      if (data) setGrupos(data);
+    } catch (e) {
+      console.error("Erro ao carregar grupos:", e);
+    } finally {
+      setCarregado(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    carregarGrupos();
+    const canal = supabase
+      .channel("grupos_alteracoes")
+      .on("postgres_changes", { event: "*", schema: "public", table: "grupos" }, () => {
+        carregarGrupos();
+      })
+      .subscribe();
+    return () => supabase.removeChannel(canal);
+  }, [carregarGrupos]);
+
+  const criarGrupo = async () => {
+    const nome = nomeNovoGrupo.trim();
+    if (!nome) return;
+    try {
+      const { data, error } = await supabase
+        .from("grupos")
+        .insert({ nome })
+        .select()
+        .single();
+      if (error) throw error;
+      setNomeNovoGrupo("");
+      setModalVisivel(false);
+      if (data) onAbrirGrupo(data);
+    } catch (e) {
+      console.error("Erro ao criar grupo:", e);
+      Alert.alert("Erro", "Não foi possível criar o grupo. Tenta outra vez.");
+    }
+  };
+
   return (
-    <View style={styles.tabBar}>
-      <TabBtn
-        activo={pestana === "calendario"}
-        onPress={() => setPestana("calendario")}
-        texto="Calendario"
-      />
-      <TabBtn
-        activo={pestana === "gastos"}
-        onPress={() => setPestana("gastos")}
-        texto="Gastos"
-      />
+    <View style={styles.flex1}>
+      <View style={styles.cabecalho}>
+        <Text style={styles.tituloApp}>Contas Partilhadas</Text>
+      </View>
+
+      <ScrollView contentContainerStyle={styles.listaGruposContainer}>
+        {carregado && grupos.length === 0 && (
+          <Text style={styles.textoVazio}>Ainda não há grupos. Cria o primeiro!</Text>
+        )}
+        {grupos.map((g) => (
+          <TouchableOpacity
+            key={g.id}
+            style={styles.cartaoGrupo}
+            onPress={() => onAbrirGrupo(g)}
+          >
+            <Text style={styles.cartaoGrupoTexto}>{g.nome}</Text>
+            <Text style={styles.cartaoGrupoSeta}>›</Text>
+          </TouchableOpacity>
+        ))}
+      </ScrollView>
+
+      <TouchableOpacity style={styles.botaoFlutuante} onPress={() => setModalVisivel(true)}>
+        <Text style={styles.botaoFlutuanteTexto}>+ Novo grupo</Text>
+      </TouchableOpacity>
+
+      <Modal visible={modalVisivel} transparent animationType="fade">
+        <KeyboardAvoidingView
+          behavior={Platform.OS === "ios" ? "padding" : undefined}
+          style={styles.modalFundo}
+        >
+          <View style={styles.modalCaixa}>
+            <Text style={styles.modalTitulo}>Novo grupo</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="Nome do grupo (ex: Viagem Porto)"
+              placeholderTextColor="#9C9484"
+              value={nomeNovoGrupo}
+              onChangeText={setNomeNovoGrupo}
+              autoFocus
+            />
+            <View style={styles.modalBotoes}>
+              <TouchableOpacity
+                style={styles.modalBotaoSecundario}
+                onPress={() => {
+                  setModalVisivel(false);
+                  setNomeNovoGrupo("");
+                }}
+              >
+                <Text style={styles.modalBotaoSecundarioTexto}>Cancelar</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.modalBotaoPrimario} onPress={criarGrupo}>
+                <Text style={styles.modalBotaoPrimarioTexto}>Criar</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
     </View>
   );
 }
 
-function TabBtn({ activo, onPress, texto }) {
-  return (
-    <TouchableOpacity
-      onPress={onPress}
-      style={[styles.tabBtn, activo && styles.tabBtnActivo]}
-    >
-      <Text style={[styles.tabBtnTexto, activo && styles.tabBtnTextoActivo]}>
-        {texto}
-      </Text>
-    </TouchableOpacity>
-  );
-}
+function TelaGrupo({ grupo, deviceId, onVoltar }) {
+  const [pessoas, setPessoas] = useState([]);
+  const [despesas, setDespesas] = useState([]);
+  const [modalPessoaVisivel, setModalPessoaVisivel] = useState(false);
+  const [nomeNovaPessoa, setNomeNovaPessoa] = useState("");
+  const [modalDespesaVisivel, setModalDespesaVisivel] = useState(false);
+  const [despesaEditar, setDespesaEditar] = useState(null);
+  const [mostrarArquivadas, setMostrarArquivadas] = useState(false);
 
-/* ---------------- PANEL CALENDARIO ---------------- */
+  const carregarPessoas = useCallback(async () => {
+    try {
+      const { data, error } = await supabase
+        .from("pessoas")
+        .select("*")
+        .eq("grupo_id", grupo.id)
+        .order("created_at", { ascending: true });
+      if (error) throw error;
+      if (data) setPessoas(data);
+    } catch (e) {
+      console.error("Erro ao carregar pessoas:", e);
+    }
+  }, [grupo.id]);
 
-function PanelCalendario({ isLocked, sueldoBase, onCambiarSueldoBase }) {
-  const hoy = new Date();
-  const [anio, setAnio] = useState(hoy.getFullYear());
-  const [mes, setMes] = useState(hoy.getMonth());
-  const [estados, setEstados] = useState({});
-  const [cargado, setCargado] = useState(false);
-  const [vacaciones, setVacaciones] = useState(34);
-
-  const [clavesConFoto, setClavesConFoto] = useState({});
-  const [modalFotosVisible, setModalFotosVisible] = useState(false);
-  const [diaFotosClave, setDiaFotosClave] = useState(null);
-  const [fotosDelDia, setFotosDelDia] = useState([]);
-  const [cargandoFotos, setCargandoFotos] = useState(false);
-  const [subiendoFoto, setSubiendoFoto] = useState(false);
-  const [fotoAmpliada, setFotoAmpliada] = useState(null);
+  const carregarDespesas = useCallback(async () => {
+    try {
+      const { data, error } = await supabase
+        .from("despesas")
+        .select("*, despesas_divisao(*)")
+        .eq("grupo_id", grupo.id)
+        .order("data", { ascending: false })
+        .order("created_at", { ascending: false });
+      if (error) throw error;
+      if (data) setDespesas(data);
+    } catch (e) {
+      console.error("Erro ao carregar despesas:", e);
+    }
+  }, [grupo.id]);
 
   useEffect(() => {
-    let activo = true;
-    (async () => {
-      const data = await leerJSON(KEY_DIAS_FOTOS, []);
-      if (activo) {
-        const mapa = {};
-        data.forEach((fila) => { mapa[fila.clave] = (mapa[fila.clave] || 0) + 1; });
-        setClavesConFoto(mapa);
-      }
-    })();
-    return () => {
-      activo = false;
-    };
-  }, []);
+    carregarPessoas();
+    carregarDespesas();
 
-  const abrirFotosDia = async (clave) => {
-    setDiaFotosClave(clave);
-    setModalFotosVisible(true);
-    setCargandoFotos(true);
+    const canal = supabase
+      .channel(`grupo_${grupo.id}_alteracoes`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "pessoas", filter: `grupo_id=eq.${grupo.id}` },
+        () => carregarPessoas()
+      )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "despesas", filter: `grupo_id=eq.${grupo.id}` },
+        () => carregarDespesas()
+      )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "despesas_divisao", filter: `grupo_id=eq.${grupo.id}` },
+        () => carregarDespesas()
+      )
+      .subscribe();
+
+    return () => supabase.removeChannel(canal);
+  }, [grupo.id, carregarPessoas, carregarDespesas]);
+
+  const nomePessoa = useCallback(
+    (id) => pessoas.find((p) => p.id === id)?.nome || "Alguém",
+    [pessoas]
+  );
+
+  const saldos = useMemo(() => {
+    const s = {};
+    pessoas.forEach((p) => {
+      s[p.id] = 0;
+    });
+    despesas.forEach((d) => {
+      if (d.archivado) return;
+      s[d.pago_por] = (s[d.pago_por] || 0) + Number(d.valor);
+      (d.despesas_divisao || []).forEach((div) => {
+        s[div.pessoa_id] = (s[div.pessoa_id] || 0) - Number(div.valor);
+      });
+    });
+    return s;
+  }, [pessoas, despesas]);
+
+  const transacoes = useMemo(() => simplificarDividas(saldos), [saldos]);
+
+  const adicionarPessoa = async () => {
+    const nome = nomeNovaPessoa.trim();
+    if (!nome) return;
     try {
-      const todas = await leerJSON(KEY_DIAS_FOTOS, []);
-      const delDia = todas
-        .filter((f) => f.clave === clave)
-        .sort((a, b) => (b.creado_en || 0) - (a.creado_en || 0));
-      setFotosDelDia(delDia);
+      const { error } = await supabase.from("pessoas").insert({ grupo_id: grupo.id, nome });
+      if (error) throw error;
+      setNomeNovaPessoa("");
+      setModalPessoaVisivel(false);
     } catch (e) {
-      console.error("Error al cargar fotos del día:", e);
-      setFotosDelDia([]);
-    } finally {
-      setCargandoFotos(false);
+      console.error("Erro ao adicionar pessoa:", e);
+      Alert.alert("Erro", "Não foi possível adicionar a pessoa.");
     }
   };
 
-  const agregarFotoADia = async (origen) => {
-    if (!diaFotosClave) return;
-    const permiso =
-      origen === "camara"
-        ? await ImagePicker.requestCameraPermissionsAsync()
-        : await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (!permiso.granted) {
-      Alert.alert(
-        "Permiso necesario",
-        origen === "camara"
-          ? "Necesitas dar permiso para usar la cámara."
-          : "Necesitas dar permiso para acceder a tus fotos."
-      );
-      return;
-    }
-    const resultado =
-      origen === "camara"
-        ? await ImagePicker.launchCameraAsync({ quality: 0.6 })
-        : await ImagePicker.launchImageLibraryAsync({
-            mediaTypes: ImagePicker.MediaTypeOptions.Images,
-            quality: 0.6
-          });
-    if (resultado.canceled || !resultado.assets || !resultado.assets[0]) return;
+  const registarPagamento = (t) => {
+    Alert.alert(
+      "Registar pagamento",
+      `${nomePessoa(t.de)} paga ${formatoMoeda(t.valor)} a ${nomePessoa(t.para)}?`,
+      [
+        { text: "Cancelar", style: "cancel" },
+        {
+          text: "OK",
+          onPress: async () => {
+            try {
+              const { data: novaDespesa, error } = await supabase
+                .from("despesas")
+                .insert({
+                  grupo_id: grupo.id,
+                  descricao: "Pagamento",
+                  valor: t.valor,
+                  pago_por: t.de,
+                  tipo_divisao: "valores",
+                  data: hojeISO(),
+                  criado_por: deviceId
+                })
+                .select()
+                .single();
+              if (error) throw error;
 
-    setSubiendoFoto(true);
-    try {
-      const rutaLocal = await guardarFotoLocal(resultado.assets[0].uri);
-      const nuevaFila = {
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        clave: diaFotosClave,
-        foto: rutaLocal,
-        creado_en: Date.now()
-      };
-      setFotosDelDia((prev) => [nuevaFila, ...prev]);
-      setClavesConFoto((prev) => ({ ...prev, [diaFotosClave]: (prev[diaFotosClave] || 0) + 1 }));
-      const todas = await leerJSON(KEY_DIAS_FOTOS, []);
-      await guardarJSON(KEY_DIAS_FOTOS, [nuevaFila, ...todas]);
-    } catch (e) {
-      console.error("Error al añadir foto:", e);
-      Alert.alert("Error", "No se pudo añadir la foto.");
-    } finally {
-      setSubiendoFoto(false);
-    }
+              const { error: erroDivisao } = await supabase.from("despesas_divisao").insert({
+                despesa_id: novaDespesa.id,
+                grupo_id: grupo.id,
+                pessoa_id: t.para,
+                valor: t.valor
+              });
+              if (erroDivisao) throw erroDivisao;
+
+              // Se este pagamento saldar tudo, arquiva o histórico do grupo
+              // (fica guardado, mas deixa de contar para as contas futuras).
+              const despesasComPagamento = [
+                ...despesas,
+                { ...novaDespesa, despesas_divisao: [{ pessoa_id: t.para, valor: t.valor }] }
+              ];
+              const saldosNovos = {};
+              pessoas.forEach((p) => {
+                saldosNovos[p.id] = 0;
+              });
+              despesasComPagamento.forEach((d) => {
+                if (d.archivado) return;
+                saldosNovos[d.pago_por] = (saldosNovos[d.pago_por] || 0) + Number(d.valor);
+                (d.despesas_divisao || []).forEach((div) => {
+                  saldosNovos[div.pessoa_id] = (saldosNovos[div.pessoa_id] || 0) - Number(div.valor);
+                });
+              });
+              if (simplificarDividas(saldosNovos).length === 0) {
+                await supabase
+                  .from("despesas")
+                  .update({ archivado: true })
+                  .eq("grupo_id", grupo.id)
+                  .eq("archivado", false);
+              }
+            } catch (e) {
+              console.error("Erro ao registar pagamento:", e);
+              Alert.alert("Erro", "Não foi possível registar o pagamento.");
+            }
+          }
+        }
+      ]
+    );
   };
 
-  const elegirOrigenFoto = () => {
-    Alert.alert("Añadir foto", "¿De dónde quieres la imagen?", [
-      { text: "Cancelar", style: "cancel" },
-      { text: "Cámara", onPress: () => agregarFotoADia("camara") },
-      { text: "Galería", onPress: () => agregarFotoADia("galeria") }
-    ]);
-  };
-
-  const eliminarFoto = (fila) => {
-    Alert.alert("Eliminar foto", "¿Seguro que quieres eliminar esta foto?", [
+  const apagarDespesa = (despesa) => {
+    Alert.alert("Apagar despesa", `Apagar "${despesa.descricao}"? Não se pode desfazer.`, [
       { text: "Cancelar", style: "cancel" },
       {
-        text: "Eliminar",
+        text: "Apagar",
         style: "destructive",
         onPress: async () => {
-          setFotosDelDia((prev) => prev.filter((f) => f.id !== fila.id));
-          setClavesConFoto((prev) => {
-            const copia = { ...prev };
-            const restante = (copia[fila.clave] || 1) - 1;
-            if (restante <= 0) delete copia[fila.clave];
-            else copia[fila.clave] = restante;
-            return copia;
-          });
           try {
-            await borrarFotoLocal(fila.foto);
-            const todas = await leerJSON(KEY_DIAS_FOTOS, []);
-            await guardarJSON(KEY_DIAS_FOTOS, todas.filter((f) => f.id !== fila.id));
+            const { error } = await supabase.from("despesas").delete().eq("id", despesa.id);
+            if (error) throw error;
           } catch (e) {
-            console.error("Error al eliminar foto:", e);
+            console.error("Erro ao apagar despesa:", e);
+            Alert.alert("Erro", "Não foi possível apagar a despesa.");
           }
         }
       }
     ]);
   };
 
-  useEffect(() => {
-    let activo = true;
-    (async () => {
-      const mapa = await leerJSON(KEY_DIAS_ESTADO, {});
-      if (activo) setEstados(mapa);
-      if (activo) setCargado(true);
-    })();
-    return () => {
-      activo = false;
-    };
-  }, []);
-
-  useEffect(() => {
-    let activo = true;
-    (async () => {
-      const mapa = await leerJSON(KEY_VACACIONES, {});
-      if (activo) setVacaciones(typeof mapa[anio] === "number" ? mapa[anio] : 34);
-    })();
-    return () => { activo = false; };
-  }, [anio]);
-
-  const cambiarVacaciones = async (texto) => {
-    const numero = texto === "" ? 0 : Number(texto.replace(/[^0-9]/g, ""));
-    setVacaciones(numero);
-    try {
-      const mapa = await leerJSON(KEY_VACACIONES, {});
-      mapa[anio] = numero;
-      await guardarJSON(KEY_VACACIONES, mapa);
-    } catch (e) {
-      console.error("Error al guardar vacaciones:", e);
-    }
-  };
-
-  const cambiarSueldo = (texto) => {
-    if (isLocked) return;
-    const numero = texto === "" ? 0 : Number(texto.replace(/[^0-9]/g, ""));
-    onCambiarSueldoBase(numero);
-  };
-
-  const alternarDia = async (dia) => {
-    if (isLocked) {
-      return;
-    }
-    const laborable = esLaborable(anio, mes, dia);
-    const clave = claveDia(anio, mes, dia);
-    const actual = estados[clave] || (laborable ? "verde" : "neutro");
-    const siguiente = siguienteEstado(actual, laborable);
-    const porDefecto = laborable ? "verde" : "neutro";
-
-    const nuevo = { ...estados };
-    if (siguiente === porDefecto) {
-      delete nuevo[clave];
-    } else {
-      nuevo[clave] = siguiente;
-    }
-    setEstados(nuevo);
-
-    try {
-      await guardarJSON(KEY_DIAS_ESTADO, nuevo);
-    } catch (e) {
-      console.error("Error al guardar:", e);
-    }
-  };
-
-  const rejilla = useMemo(() => {
-    const primerDiaSemana = new Date(anio, mes, 1).getDay();
-    const totalDias = new Date(anio, mes + 1, 0).getDate();
-    const celdas = [];
-    for (let i = 0; i < primerDiaSemana; i++) celdas.push(null);
-    for (let d = 1; d <= totalDias; d++) celdas.push(d);
-    return celdas;
-  }, [anio, mes]);
-
-  const cambiarMes = (delta) => {
-    let nuevoMes = mes + delta;
-    let nuevoAnio = anio;
-    if (nuevoMes < 0) { nuevoMes = 11; nuevoAnio -= 1; }
-    if (nuevoMes > 11) { nuevoMes = 0; nuevoAnio += 1; }
-    setMes(nuevoMes);
-    setAnio(nuevoAnio);
-  };
-
-  const panResponder = useRef(
-    PanResponder.create({
-      onMoveShouldSetPanResponder: (evt, gestureState) => {
-        return Math.abs(gestureState.dx) > 20 && Math.abs(gestureState.dx) > Math.abs(gestureState.dy) * 2;
-      },
-      onPanResponderRelease: (evt, gestureState) => {
-        if (gestureState.dx <= -50) {
-          cambiarMes(1);
-        } else if (gestureState.dx >= 50) {
-          cambiarMes(-1);
-        }
-      }
-    })
-  ).current;
-
-  const conteos = useMemo(() => {
-    const c = { verde: 0, naranja: 0, rojo: 0 };
-    rejilla.forEach((dia) => {
-      if (!dia) return;
-      const laborable = esLaborable(anio, mes, dia);
-      const clave = claveDia(anio, mes, dia);
-      const estado = estados[clave] || (laborable ? "verde" : "neutro");
-      if (c[estado] !== undefined) c[estado] += 1;
-    });
-    return c;
-  }, [rejilla, estados, anio, mes]);
-
-  const conteosAnio = useMemo(() => {
-    const c = { naranja: 0, rojo: 0 };
-    Object.entries(estados).forEach(([clave, estado]) => {
-      if (clave.startsWith(`${anio}-`) && c[estado] !== undefined) {
-        c[estado] += 1;
-      }
-    });
-    return c;
-  }, [estados, anio]);
-
-  const excedentePorMes = useMemo(() => {
-    const contarNaranjaMes = (m) => {
-      let cuenta = 0;
-      const totalDias = new Date(anio, m + 1, 0).getDate();
-      for (let d = 1; d <= totalDias; d++) {
-        if (estados[claveDia(anio, m, d)] === "naranja") cuenta += 1;
-      }
-      return cuenta;
-    };
-
-    let previo = 0;
-    const resultado = [];
-    for (let m = 0; m <= 11; m++) {
-      const cuenta = contarNaranjaMes(m);
-      const acumulado = previo + cuenta;
-      let exceso = 0;
-      if (acumulado > vacaciones) {
-        exceso = previo >= vacaciones ? cuenta : acumulado - vacaciones;
-      }
-      resultado.push(exceso);
-      previo = acumulado;
-    }
-    return resultado;
-  }, [estados, anio, vacaciones]);
-
-  const excedenteMes = excedentePorMes[mes];
-  const mesesConExceso = excedentePorMes
-    .map((exceso, m) => ({ mes: m, exceso }))
-    .filter((item) => item.exceso > 0);
-
   return (
-    <View {...panResponder.panHandlers}>
-      <View style={styles.navRow}>
-        <TouchableOpacity onPress={() => cambiarMes(-1)} style={styles.navBtn}>
-          <Text style={styles.navBtnTexto}>‹</Text>
+    <View style={styles.flex1}>
+      <View style={styles.cabecalhoGrupo}>
+        <TouchableOpacity onPress={onVoltar} style={styles.botaoVoltar}>
+          <Text style={styles.botaoVoltarTexto}>‹ Grupos</Text>
         </TouchableOpacity>
-
-        <Text style={styles.mesTitulo}>{MESES[mes]} {anio}</Text>
-
-        <TouchableOpacity onPress={() => cambiarMes(1)} style={styles.navBtn}>
-          <Text style={styles.navBtnTexto}>›</Text>
-        </TouchableOpacity>
+        <Text style={styles.tituloGrupo} numberOfLines={1}>
+          {grupo.nome}
+        </Text>
       </View>
 
-      <View style={styles.filaSemana}>
-        {DIAS_SEMANA.map((d) => (
-          <Text key={d} style={styles.diaSemanaTexto}>{d}</Text>
-        ))}
-      </View>
-
-      <View style={styles.rejilla}>
-        {rejilla.map((dia, i) => {
-          if (!dia) return <View key={`vacio-${i}`} style={styles.celdaVacia} />;
-          const laborable = esLaborable(anio, mes, dia);
-          const clave = claveDia(anio, mes, dia);
-          const estado = estados[clave] || (laborable ? "verde" : "neutro");
-          const color = COLORES[estado];
-          const esHoy = anio === hoy.getFullYear() && mes === hoy.getMonth() && dia === hoy.getDate();
-
-          return (
-            <TouchableOpacity
-              key={clave}
-              onPress={() => alternarDia(dia)}
-              onLongPress={() => abrirFotosDia(clave)}
-              delayLongPress={350}
-              style={[
-                styles.celdaDia,
-                { backgroundColor: color.bg, borderColor: esHoy ? "#2B2820" : color.ring, borderWidth: esHoy ? 2 : 1 }
-              ]}
-            >
-              <Text style={{ color: color.fg, fontWeight: esHoy ? "700" : "500", fontSize: 14 }}>
-                {dia}
-              </Text>
-              {!!clavesConFoto[clave] && <Text style={styles.indicadorFoto}>📷</Text>}
-            </TouchableOpacity>
-          );
-        })}
-      </View>
-
-      <View style={styles.leyendaFila}>
-        <Leyenda color={COLORES.verde.bg} texto={`Trabajé (${conteos.verde})`} />
-        <Leyenda color={COLORES.naranja.bg} texto={`No trabajé (${conteos.naranja})`} />
-        <Leyenda color={COLORES.rojo.bg} texto={`Médico (${conteos.rojo})`} />
-      </View>
-
-      <Text style={styles.textoAyuda}>Clica en el día para cambiar el estado. Mantén pulsado para ver/añadir fotos.</Text>
-
-      <View style={styles.filaResumen}>
-        <ResumenAnual
-          color={COLORES.naranja.bg}
-          etiqueta="No trabajé este año"
-          valor={conteosAnio.naranja}
-          alerta={conteosAnio.naranja > vacaciones}
-        />
-        <ResumenAnual color={COLORES.rojo.bg} etiqueta="Médico este año" valor={conteosAnio.rojo} />
-      </View>
-
-      <View style={styles.cajaVacaciones}>
-        <Text style={styles.cajaVacacionesTexto}>Vacaciones y festivos</Text>
-        <TextInput
-          value={String(vacaciones)}
-          onChangeText={cambiarVacaciones}
-          keyboardType="number-pad"
-          style={styles.inputVacaciones}
-        />
-      </View>
-
-      <View style={styles.cajaVacaciones}>
-        <Text style={styles.cajaVacacionesTexto}>Sueldo mensual</Text>
-        <TextInput
-          value={String(sueldoBase)}
-          onChangeText={cambiarSueldo}
-          keyboardType="number-pad"
-          editable={!isLocked}
-          style={[styles.inputVacaciones, isLocked && styles.inputBloqueado]}
-        />
-      </View>
-      {isLocked && <Text style={styles.textoAyuda}>🔒 Desbloquea la app para editar el sueldo.</Text>}
-
-      {excedenteMes > 0 && (
-        <View style={styles.cajaExceso}>
-          <Text style={styles.cajaExcesoTexto}>Días en exceso este mes</Text>
-          <Text style={styles.cajaExcesoValor}>{excedenteMes}</Text>
-        </View>
-      )}
-
-      {mesesConExceso.length > 0 && (
-        <View style={styles.listaExceso}>
-          <Text style={styles.listaExcesoTitulo}>Exceso por mes en {anio}</Text>
-          {mesesConExceso.map((item, i) => (
-            <View
-              key={item.mes}
-              style={[
-                styles.listaExcesoFila,
-                i < mesesConExceso.length - 1 && styles.listaExcesoFilaBorde
-              ]}
-            >
-              <Text style={{
-                color: item.mes === mes ? "#2B2820" : "#5C5745",
-                fontWeight: item.mes === mes ? "700" : "400",
-                fontSize: 13
-              }}>
-                {MESES[item.mes]}
-              </Text>
-              <Text style={{ fontWeight: "600", color: "#A83B32", fontSize: 13 }}>
-                {item.exceso}
-              </Text>
-            </View>
-          ))}
-        </View>
-      )}
-
-      <Modal
-        visible={modalFotosVisible}
-        transparent
-        animationType="fade"
-        onRequestClose={() => setModalFotosVisible(false)}
-      >
-        <TouchableOpacity
-          style={styles.modalLockFundo}
-          activeOpacity={1}
-          onPress={() => setModalFotosVisible(false)}
-        >
-          <TouchableOpacity activeOpacity={1} style={styles.cajaModalFotos} onPress={() => {}}>
-            <View style={styles.cabeceraModalFotos}>
-              <Text style={styles.modalLockTitulo}>{diaFotosClave}</Text>
-              <TouchableOpacity onPress={() => setModalFotosVisible(false)} style={styles.botonXFotos}>
-                <Text style={styles.botonXFotosTexto}>✕</Text>
-              </TouchableOpacity>
-            </View>
-
-            {!isLocked && (
+      <ScrollView contentContainerStyle={styles.conteudoScroll}>
+        <View style={styles.resumoCaixa}>
+          <Text style={styles.resumoTitulo}>Quem deve a quem</Text>
+          {transacoes.length === 0 ? (
+            <Text style={styles.resumoTudoOk}>Tudo em dia! 🎉</Text>
+          ) : (
+            transacoes.map((t, i) => (
               <TouchableOpacity
-                onPress={elegirOrigenFoto}
-                style={[styles.botonAgregar, subiendoFoto && { opacity: 0.6 }]}
-                disabled={subiendoFoto}
+                key={i}
+                style={styles.resumoLinha}
+                onPress={() => registarPagamento(t)}
               >
-                <Text style={styles.botonAgregarTexto}>
-                  {subiendoFoto ? "Subiendo..." : "📷 Añadir foto"}
+                <Text style={styles.resumoTexto}>
+                  <Text style={styles.resumoNome}>{nomePessoa(t.de)}</Text> deve{" "}
+                  <Text style={styles.resumoValor}>{formatoMoeda(t.valor)}</Text> a{" "}
+                  <Text style={styles.resumoNome}>{nomePessoa(t.para)}</Text>
                 </Text>
               </TouchableOpacity>
-            )}
-
-            {cargandoFotos ? (
-              <Text style={styles.textoAyuda}>Cargando fotos...</Text>
-            ) : fotosDelDia.length === 0 ? (
-              <Text style={styles.textoAyuda}>Todavía no hay fotos para este día.</Text>
-            ) : (
-              <ScrollView style={styles.scrollFotos}>
-                <View style={styles.grillaFotos}>
-                  {fotosDelDia.map((f) => (
-                    <View key={f.id} style={styles.miniFotoWrap}>
-                      <TouchableOpacity onPress={() => setFotoAmpliada(f.foto)}>
-                        <Image source={{ uri: f.foto }} style={styles.miniFoto} />
-                      </TouchableOpacity>
-                      {!isLocked && (
-                        <TouchableOpacity
-                          onPress={() => eliminarFoto(f)}
-                          style={styles.botonXMiniFoto}
-                        >
-                          <Text style={styles.botonXMiniFotoTexto}>✕</Text>
-                        </TouchableOpacity>
-                      )}
-                    </View>
-                  ))}
-                </View>
-              </ScrollView>
-            )}
-
-            <TouchableOpacity
-              onPress={() => setModalFotosVisible(false)}
-              style={[styles.modalLockBtn, { backgroundColor: "#DAD5C4", marginTop: 14 }]}
-            >
-              <Text style={{ color: "#2B2820", fontWeight: "600" }}>Cerrar</Text>
-            </TouchableOpacity>
-          </TouchableOpacity>
-        </TouchableOpacity>
-      </Modal>
-
-      <Modal
-        visible={!!fotoAmpliada}
-        transparent
-        animationType="fade"
-        onRequestClose={() => setFotoAmpliada(null)}
-      >
-        <TouchableOpacity
-          style={styles.modalFondo}
-          activeOpacity={1}
-          onPress={() => setFotoAmpliada(null)}
-        >
-          {!!fotoAmpliada && (
-            <Image source={{ uri: fotoAmpliada }} style={styles.modalImagen} resizeMode="contain" />
+            ))
           )}
-          <TouchableOpacity onPress={() => setFotoAmpliada(null)} style={styles.modalCerrarBtn}>
-            <Text style={styles.modalCerrarTexto}>Cerrar</Text>
-          </TouchableOpacity>
-        </TouchableOpacity>
-      </Modal>
-    </View>
-  );
-}
+        </View>
 
-function Leyenda({ color, texto }) {
-  return (
-    <View style={styles.leyendaItem}>
-      <View style={[styles.leyendaPunto, { backgroundColor: color }]} />
-      <Text style={styles.leyendaTexto}>{texto}</Text>
-    </View>
-  );
-}
-
-function ResumenAnual({ color, etiqueta, valor, alerta }) {
-  return (
-    <View style={styles.resumenCaja}>
-      <View style={[styles.resumenPunto, { backgroundColor: color }]} />
-      <View>
-        <Text style={styles.resumenEtiqueta}>{etiqueta}</Text>
-        <Text style={[styles.resumenValor, alerta && { color: "#A83B32" }]}>{valor}</Text>
-      </View>
-    </View>
-  );
-}
-
-/* ---------------- PANEL GASTOS ---------------- */
-
-const CUENTA = "Blue Dot";
-const TIPOS = [
-  { valor: "debe", etiqueta: "Debe" },
-  { valor: "pago", etiqueta: "Pagó" }
-];
-
-function PanelGastos({ isLocked, sueldoBase }) {
-  const [entradas, setEntradas] = useState([]);
-  const [tipo, setTipo] = useState("debe");
-  const [valor, setValor] = useState("");
-  const [dia, setDia] = useState(hoyISO());
-  const [nota, setNota] = useState("");
-  const [imagen, setImagen] = useState(null);
-  const [mostrarArchivados, setMostrarArchivados] = useState(false);
-  const [imagenVisible, setImagenVisible] = useState(null);
-
-  const [tipoRapido, setTipoRapido] = useState("sueldo");
-  const [mesRapido, setMesRapido] = useState(new Date().getMonth());
-  const [calculandoRapido, setCalculandoRapido] = useState(false);
-
-  const cargarEntradas = useCallback(async () => {
-    try {
-      const data = await leerJSON(KEY_GASTOS, []);
-      setEntradas([...data].sort((a, b) => (a.dia < b.dia ? 1 : -1)));
-    } catch (e) {
-      console.error("Error al cargar gastos:", e);
-    }
-  }, []);
-
-  useEffect(() => {
-    cargarEntradas();
-  }, [cargarEntradas]);
-
-  // Copia la foto a la carpeta de la app para que quede guardada en este dispositivo.
-  const guardarCopiaPermanente = async (uriOriginal) => {
-    return guardarFotoLocal(uriOriginal);
-  };
-
-  const elegirDeGaleria = async () => {
-    const permiso = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (!permiso.granted) {
-      Alert.alert("Permiso necesario", "Necesitas dar permiso para acceder a tus fotos.");
-      return;
-    }
-    const resultado = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      quality: 0.6
-    });
-    if (!resultado.canceled && resultado.assets && resultado.assets[0]) {
-      const rutaFinal = await guardarCopiaPermanente(resultado.assets[0].uri);
-      setImagen(rutaFinal);
-    }
-  };
-
-  const tomarFoto = async () => {
-    const permiso = await ImagePicker.requestCameraPermissionsAsync();
-    if (!permiso.granted) {
-      Alert.alert("Permiso necesario", "Necesitas dar permiso para usar la cámara.");
-      return;
-    }
-    const resultado = await ImagePicker.launchCameraAsync({ quality: 0.6 });
-    if (!resultado.canceled && resultado.assets && resultado.assets[0]) {
-      const rutaFinal = await guardarCopiaPermanente(resultado.assets[0].uri);
-      setImagen(rutaFinal);
-    }
-  };
-
-  const elegirImagen = () => {
-    Alert.alert("Añadir foto", "¿De dónde quieres la imagen?", [
-      { text: "Cancelar", style: "cancel" },
-      { text: "Cámara", onPress: tomarFoto },
-      { text: "Galería", onPress: elegirDeGaleria }
-    ]);
-  };
-
-  const agregarEntrada = async () => {
-    const numero = parseFloat(valor);
-    if (!dia || isNaN(numero)) return;
-    const nueva = {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      cuenta: CUENTA,
-      tipo,
-      valor: numero,
-      dia,
-      nota: nota.trim(),
-      imagen: imagen || null,
-      archivado: false
-    };
-    setEntradas((prev) => [nueva, ...prev].sort((a, b) => (a.dia < b.dia ? 1 : -1)));
-    setValor("");
-    setNota("");
-    setImagen(null);
-    try {
-      const actuales = await leerJSON(KEY_GASTOS, []);
-      await guardarJSON(KEY_GASTOS, [nueva, ...actuales]);
-    } catch (e) {
-      console.error("Error al guardar:", e);
-    }
-  };
-
-  const agregarEntradaConDatos = async (valorNumero, diaISO, notaTexto) => {
-    const nueva = {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      cuenta: CUENTA,
-      tipo: "debe",
-      valor: valorNumero,
-      dia: diaISO,
-      nota: notaTexto,
-      imagen: null,
-      archivado: false
-    };
-    setEntradas((prev) => [nueva, ...prev].sort((a, b) => (a.dia < b.dia ? 1 : -1)));
-    try {
-      const actuales = await leerJSON(KEY_GASTOS, []);
-      await guardarJSON(KEY_GASTOS, [nueva, ...actuales]);
-    } catch (e) {
-      console.error("Error al guardar entrada rápida:", e);
-    }
-  };
-
-  const calcularYAgregarSueldo = async (mes) => {
-    setCalculandoRapido(true);
-    try {
-      const anio = anioParaMesElegido(mes);
-      const prefijo = `${anio}-${String(mes + 1).padStart(2, "0")}-`;
-      const estadosGuardados = await leerJSON(KEY_DIAS_ESTADO, {});
-
-      let naranjaCount = 0;
-      Object.entries(estadosGuardados).forEach(([clave, estado]) => {
-        if (!clave.startsWith(prefijo)) return;
-        const dia = parseInt(clave.split("-")[2], 10);
-        if (estado === "naranja" && esLaborable(anio, mes, dia)) {
-          naranjaCount += 1;
-        }
-      });
-
-      const totalUtiles = diasUtilesDelMes(anio, mes);
-      const diasTrabajados = Math.max(totalUtiles - naranjaCount, 0);
-      const valorNumero = Math.round((sueldoBase * diasTrabajados) / totalUtiles);
-      const diaISO = ultimoDiaISO(anio, mes);
-      const notaTexto = `Sueldo de ${MESES[mes].toLowerCase()}, trabajé ${diasTrabajados} días`;
-
-      await agregarEntradaConDatos(valorNumero, diaISO, notaTexto);
-    } catch (e) {
-      console.error("Error al calcular sueldo:", e);
-      Alert.alert("Error", "No se pudo calcular el sueldo de ese mes.");
-    } finally {
-      setCalculandoRapido(false);
-    }
-  };
-
-  const calcularYAgregarVacaciones = async (mes) => {
-    setCalculandoRapido(true);
-    try {
-      const anio = anioParaMesElegido(mes);
-      const mapaVacaciones = await leerJSON(KEY_VACACIONES, {});
-      const diasVacaciones = typeof mapaVacaciones[anio] === "number" ? mapaVacaciones[anio] : 34;
-      const valorDiario = sueldoBase / 22;
-      const valorNumero = Math.round(valorDiario * diasVacaciones);
-      const diaISO = hoyISO();
-      const notaTexto = "Vacaciones y festivos";
-
-      await agregarEntradaConDatos(valorNumero, diaISO, notaTexto);
-    } catch (e) {
-      console.error("Error al calcular vacaciones:", e);
-      Alert.alert("Error", "No se pudo calcular las vacaciones y festivos de ese mes.");
-    } finally {
-      setCalculandoRapido(false);
-    }
-  };
-
-  const confirmarEntradaRapida = () => {
-    const anio = anioParaMesElegido(mesRapido);
-    const esVacaciones = tipoRapido === "vacaciones";
-    Alert.alert(
-      "Añadir entrada rápida",
-      `¿Añadir ${esVacaciones ? "vacaciones y festivos" : "sueldo"} de ${MESES[mesRapido]} ${anio}?`,
-      [
-        { text: "Cancelar", style: "cancel" },
-        {
-          text: "Añadir",
-          onPress: () =>
-            esVacaciones ? calcularYAgregarVacaciones(mesRapido) : calcularYAgregarSueldo(mesRapido)
-        }
-      ]
-    );
-  };
-
-  const alternarArchivado = async (id) => {
-    const entrada = entradas.find((e) => e.id === id);
-    if (!entrada) return;
-    const nuevoValor = !entrada.archivado;
-    setEntradas((prev) => prev.map((e) => (e.id === id ? { ...e, archivado: nuevoValor } : e)));
-    try {
-      const actuales = await leerJSON(KEY_GASTOS, []);
-      await guardarJSON(
-        KEY_GASTOS,
-        actuales.map((e) => (e.id === id ? { ...e, archivado: nuevoValor } : e))
-      );
-    } catch (e) {
-      console.error("Error al actualizar:", e);
-    }
-  };
-
-  const archivarTodo = async () => {
-    setEntradas((prev) => prev.map((e) => ({ ...e, archivado: true })));
-    try {
-      const actuales = await leerJSON(KEY_GASTOS, []);
-      await guardarJSON(KEY_GASTOS, actuales.map((e) => ({ ...e, archivado: true })));
-    } catch (e) {
-      console.error("Error al archivar todo:", e);
-    }
-  };
-
-  const eliminarEntrada = (id) => {
-    Alert.alert(
-      "Eliminar entrada",
-      "¿Seguro que quieres eliminar esta entrada? No se puede deshacer.",
-      [
-        { text: "Cancelar", style: "cancel" },
-        {
-          text: "Eliminar",
-          style: "destructive",
-          onPress: async () => {
-            setEntradas((prev) => prev.filter((e) => e.id !== id));
-            try {
-              const actuales = await leerJSON(KEY_GASTOS, []);
-              await guardarJSON(KEY_GASTOS, actuales.filter((e) => e.id !== id));
-            } catch (e) {
-              console.error("Error al eliminar:", e);
-            }
-          }
-        }
-      ]
-    );
-  };
-
-  const eliminarTodo = () => {
-    Alert.alert(
-      "Eliminar todo",
-      "¿Seguro que quieres eliminar todas las entradas? Esta acción no se puede deshacer.",
-      [
-        { text: "Cancelar", style: "cancel" },
-        {
-          text: "Eliminar todo",
-          style: "destructive",
-          onPress: async () => {
-            setEntradas([]);
-            try {
-              await guardarJSON(KEY_GASTOS, []);
-            } catch (e) {
-              console.error("Error al eliminar todo:", e);
-            }
-          }
-        }
-      ]
-    );
-  };
-
-  const totalDebido = useMemo(() => {
-    let debe = 0;
-    let pago = 0;
-    entradas.forEach((e) => {
-      if (e.archivado) return;
-      if (e.tipo === "debe") debe += e.valor;
-      else pago += e.valor;
-    });
-    return debe - pago;
-  }, [entradas]);
-
-  const formatoMoneda = (v) => {
-    const redondeado = Math.round(Math.abs(v));
-    return `$ ${redondeado.toLocaleString("es-CO")}`;
-  };
-
-  const colorTotal = totalDebido > 0 ? "#A83B32" : totalDebido < 0 ? "#3F6B4F" : "#5C5745";
-  const textoTotal = totalDebido > 0
-    ? `Blue dot debe ${formatoMoneda(totalDebido)}`
-    : totalDebido < 0
-      ? `Yo debo ${formatoMoneda(totalDebido)}`
-      : "Todo saldado";
-
-  // CORREÇÃO 2: Removida a dependência 'vacaciones' (mantendo apenas o entradas)
-  const entradasVisibles = useMemo(() => {
-    return entradas.filter((e) => mostrarArchivados || !e.archivado);
-  }, [entradas, mostrarArchivados]);
-
-  const hayArchivados = useMemo(() => {
-    return entradas.some((e) => e.archivado);
-  }, [entradas]);
-
-  return (
-    <View>
-      <Text style={styles.tituloGastos}>Gastos y pagos</Text>
-
-      {!isLocked && (
-        <View style={styles.formCaja}>
-          <Text style={styles.campoEtiqueta}>Entrada rápida</Text>
-
-          <View style={styles.toggleFila}>
-            <TouchableOpacity
-              onPress={() => setTipoRapido("sueldo")}
-              style={[styles.toggleBtn, tipoRapido === "sueldo" && styles.toggleBtnActivo]}
-            >
-              <Text style={[styles.toggleTexto, tipoRapido === "sueldo" && styles.toggleTextoActivo]}>
-                Sueldo mensual
-              </Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              onPress={() => setTipoRapido("vacaciones")}
-              style={[styles.toggleBtn, tipoRapido === "vacaciones" && styles.toggleBtnActivo]}
-            >
-              <Text style={[styles.toggleTexto, tipoRapido === "vacaciones" && styles.toggleTextoActivo]}>
-                Vacaciones y festivos
-              </Text>
+        <View style={styles.seccao}>
+          <View style={styles.seccaoCabecalho}>
+            <Text style={styles.seccaoTitulo}>Pessoas</Text>
+            <TouchableOpacity onPress={() => setModalPessoaVisivel(true)}>
+              <Text style={styles.seccaoAcao}>+ Adicionar</Text>
             </TouchableOpacity>
           </View>
-
-          <View style={styles.mesesFila}>
-            {MESES.map((nombreMes, i) => (
-              <TouchableOpacity
-                key={nombreMes}
-                onPress={() => setMesRapido(i)}
-                style={[styles.mesChip, mesRapido === i && styles.mesChipActivo]}
-              >
-                <Text style={[styles.mesChipTexto, mesRapido === i && styles.mesChipTextoActivo]}>
-                  {nombreMes.slice(0, 3)}
-                </Text>
-              </TouchableOpacity>
+          <View style={styles.chipsLinha}>
+            {pessoas.length === 0 && (
+              <Text style={styles.textoVazio}>Ainda sem pessoas neste grupo.</Text>
+            )}
+            {pessoas.map((p) => (
+              <View key={p.id} style={styles.chipPessoa}>
+                <Text style={styles.chipPessoaTexto}>{p.nome}</Text>
+              </View>
             ))}
           </View>
-
-          <Text style={styles.textoAyuda}>
-            {tipoRapido === "vacaciones"
-              ? `Se añadirá con fecha de hoy (${hoyISO()})`
-              : `Se añadirá con fecha ${ultimoDiaISO(anioParaMesElegido(mesRapido), mesRapido)}`}
-          </Text>
-
-          <TouchableOpacity
-            onPress={confirmarEntradaRapida}
-            style={[styles.botonAgregar, calculandoRapido && { opacity: 0.6 }]}
-            disabled={calculandoRapido}
-          >
-            <Text style={styles.botonAgregarTexto}>
-              {calculandoRapido ? "Calculando..." : "⚡ Calcular y añadir"}
-            </Text>
-          </TouchableOpacity>
         </View>
-      )}
 
-      {!isLocked && (
-        <View style={styles.formCaja}>
-          <View style={styles.formFila}>
-            <Campo etiqueta="Persona">
-              <View style={[styles.input, styles.inputBloqueado]}>
-                <Text style={{ color: "#5C5745" }}>{CUENTA}</Text>
-              </View>
-            </Campo>
-            <Campo etiqueta="Pagó / Debe">
-              <View style={styles.toggleFila}>
-                {TIPOS.map((t) => (
-                  <TouchableOpacity
-                    key={t.valor}
-                    onPress={() => setTipo(t.valor)}
-                    style={[styles.toggleBtn, tipo === t.valor && styles.toggleBtnActivo]}
-                  >
-                    <Text style={[styles.toggleTexto, tipo === t.valor && styles.toggleTextoActivo]}>
-                      {t.etiqueta}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-            </Campo>
-          </View>
-
-          <View style={styles.formFila}>
-            <Campo etiqueta="Valor (COP)">
-              <TextInput
-                value={valor}
-                onChangeText={setValor}
-                placeholder="0"
-                keyboardType="numeric"
-                style={styles.input}
-              />
-            </Campo>
-            <Campo etiqueta="Fecha (AAAA-MM-DD)">
-              <TextInput
-                value={dia}
-                onChangeText={setDia}
-                placeholder="2026-07-15"
-                style={styles.input}
-              />
-            </Campo>
-          </View>
-
-          <Campo etiqueta="Nota (opcional)">
-            <TextInput
-              value={nota}
-              onChangeText={setNota}
-              placeholder="p. ej. supermercado"
-              style={styles.input}
-            />
-          </Campo>
-
-          <View style={styles.campo}>
-            <Text style={styles.campoEtiqueta}>Foto (opcional)</Text>
-            {imagen ? (
-              <View style={styles.previaFotoFila}>
-                <Image source={{ uri: imagen }} style={styles.previaFoto} />
-                <TouchableOpacity onPress={() => setImagen(null)} style={styles.botonQuitarFoto}>
-                  <Text style={styles.botonQuitarFotoTexto}>Eliminar</Text>
-                </TouchableOpacity>
-              </View>
-            ) : (
-              <TouchableOpacity onPress={elegirImagen} style={styles.botonFoto}>
-                <Text style={styles.botonFotoTexto}>📎 Añadir foto</Text>
-              </TouchableOpacity>
-            )}
-          </View>
-
-          <TouchableOpacity onPress={agregarEntrada} style={styles.botonAgregar}>
-            <Text style={styles.botonAgregarTexto}>+ Añadir entrada</Text>
-          </TouchableOpacity>
-        </View>
-      )}
-
-      <View style={[styles.totalCaja, { borderColor: colorTotal }]}>
-        <Text style={styles.totalEtiqueta}>Total</Text>
-        <Text style={[styles.totalValor, { color: colorTotal }]}>{textoTotal}</Text>
-      </View>
-
-      {hayArchivados && (
-        <View style={[styles.filaAcciones, { marginBottom: 10 }]}>
-          <TouchableOpacity
-            onPress={() => setMostrarArchivados((v) => !v)}
-            style={styles.botonAccionSecundario}
-          >
-            <Text style={styles.botonAccionSecundarioTexto}>
-              {mostrarArchivados ? "Ocultar archivados" : "Ver archivados"}
-            </Text>
-          </TouchableOpacity>
-        </View>
-      )}
-
-      {!isLocked && (
-        <View style={styles.filaAcciones}>
-          <TouchableOpacity
-            onPress={archivarTodo}
-            style={styles.botonAccionSecundario}
-            disabled={entradas.length === 0}
-          >
-            <Text style={styles.botonAccionSecundarioTexto}>Archivar todo</Text>
-          </TouchableOpacity>
-          
-          <TouchableOpacity
-            onPress={eliminarTodo}
-            style={styles.botonAccionPeligro}
-            disabled={entradas.length === 0}
-          >
-            <Text style={styles.botonAccionPeligroTexto}>Eliminar todo</Text>
-          </TouchableOpacity>
-        </View>
-      )}
-
-      <View style={styles.listaGastos}>
-        {entradasVisibles.length === 0 ? (
-          <Text style={styles.listaVacia}>
-            {entradas.length === 0
-              ? "Todavía no hay entradas. Añade la primera arriba."
-              : "No hay entradas para mostrar."}
-          </Text>
-        ) : (
-          entradasVisibles.map((e, i) => (
+        <View style={styles.seccao}>
+          <View style={styles.seccaoCabecalho}>
+            <Text style={styles.seccaoTitulo}>Despesas</Text>
             <TouchableOpacity
-              key={e.id}
-              activeOpacity={e.imagen ? 0.6 : 1}
-              onPress={() => e.imagen && setImagenVisible(e.imagen)}
-              style={[
-                styles.filaGasto,
-                i < entradasVisibles.length - 1 && styles.filaGastoBorde,
-                e.archivado && styles.filaGastoArchivada
-              ]}
+              onPress={() => {
+                if (pessoas.length === 0) {
+                  Alert.alert("Adiciona pessoas primeiro", "Precisas de pelo menos uma pessoa no grupo.");
+                  return;
+                }
+                setDespesaEditar(null);
+                setModalDespesaVisivel(true);
+              }}
             >
-              <View style={styles.filaGastoTop}>
-                <View style={styles.filaGastoIzq}>
-                  <View style={[
-                    styles.badge,
-                    { backgroundColor: e.tipo === "debe" ? "#A83B32" : "#3F6B4F" }
-                  ]}>
-                    <Text style={styles.badgeTexto}>{e.tipo === "debe" ? "DEBE" : "PAGÓ"}</Text>
-                  </View>
-                  <Text style={styles.filaGastoFecha}>{e.dia}</Text>
-                  {!!e.imagen && <Text style={styles.iconoFoto}>📷</Text>}
-                  {e.archivado && <Text style={styles.etiquetaArchivado}>Archivado</Text>}
-                </View>
-                <View style={styles.filaGastoDer}>
-                  <Text style={styles.filaGastoValor}>{formatoMoneda(e.valor)}</Text>
-                  {!isLocked && (
-                    <>
-                      <TouchableOpacity onPress={() => alternarArchivado(e.id)} style={styles.botonEliminar}>
-                        <Text style={{ color: "#7A7461", fontSize: 13 }}>
-                          {e.archivado ? "↺" : "🗄"}
-                        </Text>
-                      </TouchableOpacity>
-                      
-                      <TouchableOpacity onPress={() => eliminarEntrada(e.id)} style={styles.botonEliminar}>
-                        <Text style={{ color: "#B33F3F", fontSize: 16 }}>×</Text>
-                      </TouchableOpacity>
-                    </>
-                  )}
-                </View>
-              </View>
-              {!!e.nota && <Text style={styles.filaGastoNota} numberOfLines={2}>{e.nota}</Text>}
+              <Text style={styles.seccaoAcao}>+ Nova despesa</Text>
             </TouchableOpacity>
-          ))
-        )}
-      </View>
+          </View>
 
-      <Modal
-        visible={!!imagenVisible}
-        transparent
-        animationType="fade"
-        onRequestClose={() => setImagenVisible(null)}
-      >
-        <TouchableOpacity
-          style={styles.modalFondo}
-          activeOpacity={1}
-          onPress={() => setImagenVisible(null)}
-        >
-          {!!imagenVisible && (
-            <Image
-              source={{ uri: imagenVisible }}
-              style={styles.modalImagen}
-              resizeMode="contain"
-            />
+          {despesas.length === 0 && (
+            <Text style={styles.textoVazio}>Ainda sem despesas.</Text>
           )}
-          <TouchableOpacity onPress={() => setImagenVisible(null)} style={styles.modalCerrarBtn}>
-            <Text style={styles.modalCerrarTexto}>Cerrar</Text>
-          </TouchableOpacity>
-        </TouchableOpacity>
+
+          {despesas
+            .filter((d) => !!d.archivado === mostrarArquivadas)
+            .map((d) => (
+            <View key={d.id} style={styles.itemDespesa}>
+              <View style={styles.itemDespesaTop}>
+                <Text style={styles.itemDespesaDescricao} numberOfLines={1}>
+                  {d.descricao}
+                </Text>
+                <Text style={styles.itemDespesaValor}>{formatoMoeda(d.valor)}</Text>
+              </View>
+              <View style={styles.itemDespesaBaixo}>
+                <Text style={styles.itemDespesaDetalhe}>
+                  {nomePessoa(d.pago_por)} pagou · {d.data}
+                </Text>
+                {d.criado_por === deviceId && !d.archivado && (
+                  <View style={styles.itemDespesaAcoes}>
+                    <TouchableOpacity
+                      onPress={() => {
+                        setDespesaEditar(d);
+                        setModalDespesaVisivel(true);
+                      }}
+                      style={styles.itemDespesaBotao}
+                    >
+                      <Text style={styles.itemDespesaBotaoTexto}>Editar</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity onPress={() => apagarDespesa(d)} style={styles.itemDespesaBotao}>
+                      <Text style={[styles.itemDespesaBotaoTexto, styles.itemDespesaBotaoApagar]}>
+                        Apagar
+                      </Text>
+                    </TouchableOpacity>
+                  </View>
+                )}
+              </View>
+            </View>
+          ))}
+
+          {despesas.some((d) => d.archivado) && (
+            <TouchableOpacity onPress={() => setMostrarArquivadas((v) => !v)}>
+              <Text style={styles.seccaoAcao}>
+                {mostrarArquivadas ? "Ver despesas ativas" : "Ver histórico arquivado"}
+              </Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      </ScrollView>
+
+      <Modal visible={modalPessoaVisivel} transparent animationType="fade">
+        <KeyboardAvoidingView
+          behavior={Platform.OS === "ios" ? "padding" : undefined}
+          style={styles.modalFundo}
+        >
+          <View style={styles.modalCaixa}>
+            <Text style={styles.modalTitulo}>Nova pessoa</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="Nome"
+              placeholderTextColor="#9C9484"
+              value={nomeNovaPessoa}
+              onChangeText={setNomeNovaPessoa}
+              autoFocus
+            />
+            <View style={styles.modalBotoes}>
+              <TouchableOpacity
+                style={styles.modalBotaoSecundario}
+                onPress={() => {
+                  setModalPessoaVisivel(false);
+                  setNomeNovaPessoa("");
+                }}
+              >
+                <Text style={styles.modalBotaoSecundarioTexto}>Cancelar</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.modalBotaoPrimario} onPress={adicionarPessoa}>
+                <Text style={styles.modalBotaoPrimarioTexto}>Adicionar</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </KeyboardAvoidingView>
       </Modal>
+
+      {modalDespesaVisivel && (
+        <ModalDespesa
+          visivel={modalDespesaVisivel}
+          grupoId={grupo.id}
+          deviceId={deviceId}
+          pessoas={pessoas}
+          despesaEditar={despesaEditar}
+          onFechar={() => {
+            setModalDespesaVisivel(false);
+            setDespesaEditar(null);
+          }}
+        />
+      )}
     </View>
   );
 }
 
-function Campo({ etiqueta, children }) {
+const TIPOS_DIVISAO = [
+  { valor: "igual", etiqueta: "Igual" },
+  { valor: "valores", etiqueta: "Valores" },
+  { valor: "percentagens", etiqueta: "%" }
+];
+
+function ModalDespesa({ visivel, grupoId, deviceId, pessoas, despesaEditar, onFechar }) {
+  const editando = !!despesaEditar;
+
+  const [descricao, setDescricao] = useState(despesaEditar?.descricao || "");
+  const [valor, setValor] = useState(despesaEditar ? String(despesaEditar.valor) : "");
+  const [data, setData] = useState(despesaEditar?.data || hojeISO());
+  const [pagoPor, setPagoPor] = useState(
+    despesaEditar?.pago_por || (pessoas[0] ? pessoas[0].id : null)
+  );
+  const [tipoDivisao, setTipoDivisao] = useState(despesaEditar?.tipo_divisao || "igual");
+  const [participantes, setParticipantes] = useState(() => {
+    if (despesaEditar) {
+      return new Set((despesaEditar.despesas_divisao || []).map((d) => d.pessoa_id));
+    }
+    return new Set(pessoas.map((p) => p.id));
+  });
+  const [valoresPersonalizados, setValoresPersonalizados] = useState(() => {
+    const inicial = {};
+    if (despesaEditar) {
+      (despesaEditar.despesas_divisao || []).forEach((d) => {
+        inicial[d.pessoa_id] = String(d.valor);
+      });
+    }
+    return inicial;
+  });
+  const [percentagens, setPercentagens] = useState(() => {
+    const inicial = {};
+    if (despesaEditar && despesaEditar.tipo_divisao === "percentagens") {
+      const total = Number(despesaEditar.valor) || 1;
+      (despesaEditar.despesas_divisao || []).forEach((d) => {
+        inicial[d.pessoa_id] = String(((Number(d.valor) / total) * 100).toFixed(2));
+      });
+    }
+    return inicial;
+  });
+  const [aGuardar, setAGuardar] = useState(false);
+
+  const alternarParticipante = (id) => {
+    setParticipantes((prev) => {
+      const copia = new Set(prev);
+      if (copia.has(id)) copia.delete(id);
+      else copia.add(id);
+      return copia;
+    });
+  };
+
+  const totalNumero = parseFloat(valor.replace(",", ".")) || 0;
+
+  const somaValoresPersonalizados = useMemo(() => {
+    let soma = 0;
+    pessoas.forEach((p) => {
+      if (participantes.has(p.id)) {
+        soma += parseFloat((valoresPersonalizados[p.id] || "0").replace(",", ".")) || 0;
+      }
+    });
+    return soma;
+  }, [valoresPersonalizados, participantes, pessoas]);
+
+  const somaPercentagens = useMemo(() => {
+    let soma = 0;
+    pessoas.forEach((p) => {
+      if (participantes.has(p.id)) {
+        soma += parseFloat((percentagens[p.id] || "0").replace(",", ".")) || 0;
+      }
+    });
+    return soma;
+  }, [percentagens, participantes, pessoas]);
+
+  const guardar = async () => {
+    const descricaoLimpa = descricao.trim();
+    const participantesIds = pessoas.filter((p) => participantes.has(p.id)).map((p) => p.id);
+
+    if (!descricaoLimpa) {
+      Alert.alert("Falta a descrição", "Dá um nome à despesa.");
+      return;
+    }
+    if (!totalNumero || totalNumero <= 0) {
+      Alert.alert("Valor inválido", "Introduz um valor maior que zero.");
+      return;
+    }
+    if (!pagoPor) {
+      Alert.alert("Falta quem pagou", "Escolhe quem pagou a despesa.");
+      return;
+    }
+    if (participantesIds.length === 0) {
+      Alert.alert("Falta quem participa", "Escolhe pelo menos uma pessoa na divisão.");
+      return;
+    }
+    if (tipoDivisao === "valores" && Math.abs(somaValoresPersonalizados - totalNumero) > 0.01) {
+      Alert.alert(
+        "Valores não batem certo",
+        `A soma dos valores (${formatoMoeda(somaValoresPersonalizados)}) tem de ser igual ao total (${formatoMoeda(totalNumero)}).`
+      );
+      return;
+    }
+    if (tipoDivisao === "percentagens" && Math.abs(somaPercentagens - 100) > 0.5) {
+      Alert.alert(
+        "Percentagens não somam 100%",
+        `As percentagens somam ${somaPercentagens.toFixed(1)}%, têm de somar 100%.`
+      );
+      return;
+    }
+
+    let divisaoFinal = {};
+    if (tipoDivisao === "igual") {
+      divisaoFinal = dividirIgual(totalNumero, participantesIds);
+    } else if (tipoDivisao === "valores") {
+      participantesIds.forEach((id) => {
+        divisaoFinal[id] = parseFloat((valoresPersonalizados[id] || "0").replace(",", ".")) || 0;
+      });
+    } else {
+      participantesIds.forEach((id) => {
+        const pct = parseFloat((percentagens[id] || "0").replace(",", ".")) || 0;
+        divisaoFinal[id] = Math.round(((totalNumero * pct) / 100) * 100) / 100;
+      });
+    }
+
+    setAGuardar(true);
+    try {
+      let despesaId = despesaEditar?.id;
+      if (editando) {
+        const { error } = await supabase
+          .from("despesas")
+          .update({
+            descricao: descricaoLimpa,
+            valor: totalNumero,
+            pago_por: pagoPor,
+            tipo_divisao: tipoDivisao,
+            data
+          })
+          .eq("id", despesaId);
+        if (error) throw error;
+        await supabase.from("despesas_divisao").delete().eq("despesa_id", despesaId);
+      } else {
+        const { data: novaDespesa, error } = await supabase
+          .from("despesas")
+          .insert({
+            grupo_id: grupoId,
+            descricao: descricaoLimpa,
+            valor: totalNumero,
+            pago_por: pagoPor,
+            tipo_divisao: tipoDivisao,
+            data,
+            criado_por: deviceId
+          })
+          .select()
+          .single();
+        if (error) throw error;
+        despesaId = novaDespesa.id;
+      }
+
+      const linhasDivisao = Object.entries(divisaoFinal).map(([pessoaId, val]) => ({
+        despesa_id: despesaId,
+        grupo_id: grupoId,
+        pessoa_id: pessoaId,
+        valor: val
+      }));
+      const { error: erroDivisao } = await supabase.from("despesas_divisao").insert(linhasDivisao);
+      if (erroDivisao) throw erroDivisao;
+
+      onFechar();
+    } catch (e) {
+      console.error("Erro ao guardar despesa:", e);
+      Alert.alert("Erro", "Não foi possível guardar a despesa.");
+    } finally {
+      setAGuardar(false);
+    }
+  };
+
   return (
-    <View style={styles.campo}>
-      <Text style={styles.campoEtiqueta}>{etiqueta}</Text>
-      {children}
-    </View>
+    <Modal visible={visivel} transparent animationType="slide">
+      <KeyboardAvoidingView
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+        style={styles.modalFundo}
+      >
+        <View style={styles.modalCaixaGrande}>
+          <ScrollView keyboardShouldPersistTaps="handled">
+            <Text style={styles.modalTitulo}>{editando ? "Editar despesa" : "Nova despesa"}</Text>
+
+            <Text style={styles.rotulo}>Descrição</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="Ex: Jantar, Combustível..."
+              placeholderTextColor="#9C9484"
+              value={descricao}
+              onChangeText={setDescricao}
+            />
+
+            <Text style={styles.rotulo}>Valor total</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="0.00"
+              placeholderTextColor="#9C9484"
+              keyboardType="decimal-pad"
+              value={valor}
+              onChangeText={setValor}
+            />
+
+            <Text style={styles.rotulo}>Data</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="AAAA-MM-DD"
+              placeholderTextColor="#9C9484"
+              value={data}
+              onChangeText={setData}
+            />
+
+            <Text style={styles.rotulo}>Quem pagou</Text>
+            <View style={styles.chipsLinha}>
+              {pessoas.map((p) => (
+                <TouchableOpacity
+                  key={p.id}
+                  style={[styles.chipSelecionavel, pagoPor === p.id && styles.chipSelecionado]}
+                  onPress={() => setPagoPor(p.id)}
+                >
+                  <Text
+                    style={[
+                      styles.chipSelecionavelTexto,
+                      pagoPor === p.id && styles.chipSelecionadoTexto
+                    ]}
+                  >
+                    {p.nome}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            <Text style={styles.rotulo}>Como dividir</Text>
+            <View style={styles.segmentado}>
+              {TIPOS_DIVISAO.map((t) => (
+                <TouchableOpacity
+                  key={t.valor}
+                  style={[styles.segmentadoBotao, tipoDivisao === t.valor && styles.segmentadoBotaoAtivo]}
+                  onPress={() => setTipoDivisao(t.valor)}
+                >
+                  <Text
+                    style={[
+                      styles.segmentadoBotaoTexto,
+                      tipoDivisao === t.valor && styles.segmentadoBotaoTextoAtivo
+                    ]}
+                  >
+                    {t.etiqueta}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            <Text style={styles.rotulo}>Entre quem</Text>
+            {pessoas.map((p) => {
+              const selecionado = participantes.has(p.id);
+              return (
+                <View key={p.id} style={styles.linhaParticipante}>
+                  <TouchableOpacity
+                    style={styles.linhaParticipanteNome}
+                    onPress={() => alternarParticipante(p.id)}
+                  >
+                    <View style={[styles.caixaSelecao, selecionado && styles.caixaSelecaoAtiva]}>
+                      {selecionado && <Text style={styles.caixaSelecaoMarca}>✓</Text>}
+                    </View>
+                    <Text style={styles.linhaParticipanteTexto}>{p.nome}</Text>
+                  </TouchableOpacity>
+
+                  {selecionado && tipoDivisao === "valores" && (
+                    <TextInput
+                      style={styles.inputPequeno}
+                      placeholder="0.00"
+                      placeholderTextColor="#9C9484"
+                      keyboardType="decimal-pad"
+                      value={valoresPersonalizados[p.id] || ""}
+                      onChangeText={(t) =>
+                        setValoresPersonalizados((prev) => ({ ...prev, [p.id]: t }))
+                      }
+                    />
+                  )}
+                  {selecionado && tipoDivisao === "percentagens" && (
+                    <TextInput
+                      style={styles.inputPequeno}
+                      placeholder="0%"
+                      placeholderTextColor="#9C9484"
+                      keyboardType="decimal-pad"
+                      value={percentagens[p.id] || ""}
+                      onChangeText={(t) => setPercentagens((prev) => ({ ...prev, [p.id]: t }))}
+                    />
+                  )}
+                </View>
+              );
+            })}
+
+            {tipoDivisao === "valores" && (
+              <Text style={styles.textoAjudaSoma}>
+                Soma: {formatoMoeda(somaValoresPersonalizados)} de {formatoMoeda(totalNumero)}
+              </Text>
+            )}
+            {tipoDivisao === "percentagens" && (
+              <Text style={styles.textoAjudaSoma}>Soma: {somaPercentagens.toFixed(1)}% de 100%</Text>
+            )}
+
+            <View style={styles.modalBotoes}>
+              <TouchableOpacity style={styles.modalBotaoSecundario} onPress={onFechar}>
+                <Text style={styles.modalBotaoSecundarioTexto}>Cancelar</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.modalBotaoPrimario}
+                onPress={guardar}
+                disabled={aGuardar}
+              >
+                <Text style={styles.modalBotaoPrimarioTexto}>
+                  {aGuardar ? "A guardar..." : editando ? "Guardar" : "Adicionar"}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </ScrollView>
+        </View>
+      </KeyboardAvoidingView>
+    </Modal>
   );
 }
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: "#EDE9DC" },
-  scrollContent: { padding: 16, paddingTop: 56, paddingBottom: 40 },
+  safe: { flex: 1, backgroundColor: "#F7F3EA" },
+  flex1: { flex: 1 },
 
-  tabBar: {
-    flexDirection: "row",
-    gap: 6,
-    backgroundColor: "#F7F4EA",
-    borderWidth: 1,
-    borderColor: "#DAD5C4",
-    borderRadius: 10,
-    padding: 4,
-    marginBottom: 18
+  cabecalho: {
+    paddingHorizontal: 20,
+    paddingTop: 44,
+    paddingBottom: 16
   },
-  tabBtn: {
-    flex: 1,
-    paddingVertical: 9,
-    borderRadius: 7,
-    alignItems: "center",
-    justifyContent: "center"
-  },
-  tabBtnActivo: { backgroundColor: "#2B2820" },
-  tabBtnTexto: { color: "#5C5745", fontWeight: "600", fontSize: 13 },
-  tabBtnTextoActivo: { color: "#F3F1E7" },
+  tituloApp: { fontSize: 24, fontWeight: "700", color: "#2B2820" },
 
-  navRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: 16
-  },
-  navBtn: {
-    width: 34,
-    height: 34,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: "#DAD5C4",
-    backgroundColor: "#F7F4EA",
-    alignItems: "center",
-    justifyContent: "center"
-  },
-  navBtnTexto: { fontSize: 18, color: "#2B2820" },
-  mesTitulo: { fontSize: 16, fontWeight: "700", color: "#2B2820" },
+  listaGruposContainer: { paddingHorizontal: 20, paddingBottom: 100, gap: 10 },
+  textoVazio: { color: "#8A8270", fontSize: 13.5, paddingVertical: 8 },
 
-  filaSemana: { flexDirection: "row", marginBottom: 6 },
-  diaSemanaTexto: {
-    flex: 1,
-    textAlign: "center",
-    fontSize: 11,
-    color: "#9B9581",
-    fontWeight: "600"
-  },
-
-  rejilla: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    backgroundColor: "#F7F4EA",
-    borderWidth: 1,
-    borderColor: "#DAD5C4",
-    borderRadius: 10,
-    padding: 6
-  },
-  celdaVacia: { width: `${100 / 7}%`, aspectRatio: 1 },
-  celdaDia: {
-    width: `${100 / 7}%`,
-    aspectRatio: 1,
-    borderRadius: 8,
-    alignItems: "center",
-    justifyContent: "center",
-    marginVertical: 3
-  },
-  indicadorFoto: {
-    position: "absolute",
-    bottom: 2,
-    right: 4,
-    fontSize: 9
-  },
-  cajaModalFotos: {
-    width: "100%",
-    maxWidth: 340,
-    maxHeight: "80%",
-    backgroundColor: "#F7F4EA",
-    borderRadius: 12,
-    padding: 20,
-    alignItems: "center",
-    borderWidth: 1,
-    borderColor: "#DAD5C4"
-  },
-  cabeceraModalFotos: {
-    width: "100%",
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    marginBottom: 15,
-    position: "relative"
-  },
-  botonXFotos: {
-    position: "absolute",
-    right: 0,
-    top: -4,
-    padding: 6
-  },
-  botonXFotosTexto: { fontSize: 16, color: "#5C5745", fontWeight: "700" },
-  scrollFotos: { width: "100%", maxHeight: 320, marginTop: 6 },
-  grillaFotos: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 8,
-    justifyContent: "flex-start"
-  },
-  miniFoto: {
-    width: 90,
-    height: 90,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: "#DAD5C4"
-  },
-  miniFotoWrap: {
-    width: 90,
-    height: 90
-  },
-  botonXMiniFoto: {
-    position: "absolute",
-    top: -6,
-    right: -6,
-    width: 22,
-    height: 22,
-    borderRadius: 11,
-    backgroundColor: "#A83B32",
-    alignItems: "center",
-    justifyContent: "center",
-    borderWidth: 1.5,
-    borderColor: "#F7F4EA"
-  },
-  botonXMiniFotoTexto: { color: "#F7F4EA", fontSize: 11, fontWeight: "700" },
-
-  leyendaFila: { flexDirection: "row", flexWrap: "wrap", gap: 14, marginTop: 18 },
-  leyendaItem: { flexDirection: "row", alignItems: "center", gap: 6 },
-  leyendaPunto: { width: 11, height: 11, borderRadius: 3 },
-  leyendaTexto: { fontSize: 12, color: "#5C5745" },
-
-  textoAyuda: { fontSize: 12.5, color: "#9B9581", marginTop: 18 },
-
-  filaResumen: { flexDirection: "row", gap: 10, marginTop: 16 },
-  resumenCaja: {
-    flex: 1,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    backgroundColor: "#F7F4EA",
-    borderWidth: 1,
-    borderColor: "#DAD5C4",
-    borderRadius: 10,
-    padding: 10
-  },
-  resumenPunto: { width: 10, height: 10, borderRadius: 3 },
-  resumenEtiqueta: { fontSize: 10.5, color: "#9B9581" },
-  resumenValor: { fontSize: 18, fontWeight: "700", color: "#2B2820" },
-
-  mesesFila: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 6,
-    marginTop: 10,
-    marginBottom: 4
-  },
-  mesChip: {
-    paddingVertical: 6,
-    paddingHorizontal: 10,
-    borderRadius: 7,
-    borderWidth: 1,
-    borderColor: "#DAD5C4",
-    backgroundColor: "#FFFFFF"
-  },
-  mesChipActivo: { backgroundColor: "#2B2820", borderColor: "#2B2820" },
-  mesChipTexto: { fontSize: 12, color: "#5C5745", fontWeight: "600" },
-  mesChipTextoActivo: { color: "#F3F1E7" },
-
-  cajaVacaciones: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginTop: 12,
-    padding: 12,
-    backgroundColor: "#F7F4EA",
-    borderWidth: 1,
-    borderColor: "#DAD5C4",
-    borderRadius: 10
-  },
-  cajaVacacionesTexto: { fontSize: 13, color: "#5C5745" },
-  inputBloqueado: { opacity: 0.5 },
-  inputVacaciones: {
-    width: 64,
-    textAlign: "center",
-    paddingVertical: 4,
-    borderWidth: 1,
-    borderColor: "#DAD5C4",
-    borderRadius: 7,
+  cartaoGrupo: {
     backgroundColor: "#FFFFFF",
-    fontSize: 13
-  },
-
-  cajaExceso: {
+    borderRadius: 14,
+    paddingVertical: 16,
+    paddingHorizontal: 18,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    marginTop: 8,
-    padding: 12,
-    backgroundColor: "#FBEDEB",
     borderWidth: 1,
-    borderColor: "#E3B8B2",
-    borderRadius: 10
+    borderColor: "#EAE2CF"
   },
-  cajaExcesoTexto: { fontSize: 12.5, color: "#8A2F27" },
-  cajaExcesoValor: { fontSize: 18, fontWeight: "700", color: "#A83B32" },
+  cartaoGrupoTexto: { fontSize: 16, fontWeight: "600", color: "#2B2820" },
+  cartaoGrupoSeta: { fontSize: 20, color: "#B7AE97" },
 
-  listaExceso: {
-    marginTop: 12,
-    backgroundColor: "#F7F4EA",
-    borderWidth: 1,
-    borderColor: "#DAD5C4",
-    borderRadius: 10,
-    overflow: "hidden"
+  botaoFlutuante: {
+    position: "absolute",
+    bottom: 24,
+    left: 20,
+    right: 20,
+    backgroundColor: "#3F6B4F",
+    borderRadius: 14,
+    paddingVertical: 15,
+    alignItems: "center"
   },
-  listaExcesoTitulo: {
-    padding: 12,
-    fontSize: 11,
-    letterSpacing: 0.5,
-    textTransform: "uppercase",
-    color: "#9B9581",
-    borderBottomWidth: 1,
-    borderBottomColor: "#DAD5C4"
-  },
-  listaExcesoFila: {
+  botaoFlutuanteTexto: { color: "#FFFFFF", fontWeight: "700", fontSize: 15.5 },
+
+  cabecalhoGrupo: {
+    paddingHorizontal: 20,
+    paddingTop: 44,
+    paddingBottom: 10,
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "space-between",
+    gap: 10
+  },
+  botaoVoltar: { paddingVertical: 4, paddingRight: 4 },
+  botaoVoltarTexto: { color: "#3F6B4F", fontSize: 15, fontWeight: "600" },
+  tituloGrupo: { fontSize: 19, fontWeight: "700", color: "#2B2820", flexShrink: 1 },
+
+  conteudoScroll: { paddingHorizontal: 20, paddingBottom: 100, gap: 18 },
+
+  resumoCaixa: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 14,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: "#EAE2CF",
+    gap: 8
+  },
+  resumoTitulo: { fontSize: 14, fontWeight: "700", color: "#5C5745", marginBottom: 2 },
+  resumoTudoOk: { fontSize: 15, color: "#3F6B4F", fontWeight: "600" },
+  resumoLinha: { paddingVertical: 2 },
+  resumoTexto: { fontSize: 14.5, color: "#2B2820", lineHeight: 21 },
+  resumoNome: { fontWeight: "700" },
+  resumoValor: { fontWeight: "700", color: "#A83B32" },
+
+  seccao: { gap: 10 },
+  seccaoCabecalho: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between"
+  },
+  seccaoTitulo: { fontSize: 16, fontWeight: "700", color: "#2B2820" },
+  seccaoAcao: { fontSize: 13.5, fontWeight: "700", color: "#3F6B4F" },
+
+  chipsLinha: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
+  chipPessoa: {
+    backgroundColor: "#EFEADC",
+    borderRadius: 20,
     paddingHorizontal: 12,
-    paddingVertical: 8
+    paddingVertical: 7
   },
-  listaExcesoFilaBorde: { borderBottomWidth: 1, borderBottomColor: "#ECE7D8" },
+  chipPessoaTexto: { fontSize: 13.5, color: "#2B2820", fontWeight: "600" },
 
-  tituloGastos: { fontSize: 26, fontWeight: "700", color: "#2B2820", marginBottom: 16 },
-
-  formCaja: {
-    backgroundColor: "#F7F4EA",
+  chipSelecionavel: {
+    backgroundColor: "#EFEADC",
+    borderRadius: 20,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
     borderWidth: 1,
-    borderColor: "#DAD5C4",
-    borderRadius: 10,
-    padding: 14,
-    marginBottom: 18
+    borderColor: "#EFEADC"
   },
-  formFila: { flexDirection: "row", gap: 10 },
-  campo: { flex: 1, marginBottom: 10 },
-  campoEtiqueta: { fontSize: 11, color: "#9B9581", marginBottom: 4 },
-  input: {
-    borderWidth: 1,
-    borderColor: "#DAD5C4",
-    borderRadius: 7,
+  chipSelecionado: { backgroundColor: "#3F6B4F", borderColor: "#3F6B4F" },
+  chipSelecionavelTexto: { fontSize: 13.5, color: "#2B2820", fontWeight: "600" },
+  chipSelecionadoTexto: { color: "#FFFFFF" },
+
+  itemDespesa: {
     backgroundColor: "#FFFFFF",
-    paddingHorizontal: 10,
-    paddingVertical: Platform.OS === "ios" ? 9 : 6,
-    fontSize: 13,
+    borderRadius: 12,
+    padding: 14,
+    borderWidth: 1,
+    borderColor: "#EAE2CF",
+    gap: 6
+  },
+  itemDespesaTop: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10
+  },
+  itemDespesaDescricao: { fontSize: 15, fontWeight: "700", color: "#2B2820", flexShrink: 1 },
+  itemDespesaValor: { fontSize: 15, fontWeight: "700", color: "#2B2820" },
+  itemDespesaBaixo: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between"
+  },
+  itemDespesaDetalhe: { fontSize: 12.5, color: "#8A8270" },
+  itemDespesaAcoes: { flexDirection: "row", gap: 14 },
+  itemDespesaBotao: { padding: 4 },
+  itemDespesaBotaoTexto: { fontSize: 12.5, fontWeight: "700", color: "#3F6B4F" },
+  itemDespesaBotaoApagar: { color: "#A83B32" },
+
+  modalFundo: {
+    flex: 1,
+    backgroundColor: "rgba(43,40,32,0.4)",
+    justifyContent: "flex-end"
+  },
+  modalCaixa: {
+    backgroundColor: "#F7F3EA",
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    padding: 20,
+    paddingBottom: 30,
+    gap: 12
+  },
+  modalCaixaGrande: {
+    backgroundColor: "#F7F3EA",
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    padding: 20,
+    paddingBottom: 30,
+    maxHeight: "88%"
+  },
+  modalTitulo: { fontSize: 18, fontWeight: "700", color: "#2B2820", marginBottom: 8 },
+  rotulo: { fontSize: 12.5, fontWeight: "700", color: "#5C5745", marginTop: 12, marginBottom: 6 },
+
+  input: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#E4DCC8",
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    fontSize: 15,
     color: "#2B2820"
   },
-  inputBloqueado: {
-    justifyContent: "center",
-    backgroundColor: "#EDE9DC"
-  },
-
-  toggleFila: { flexDirection: "row", gap: 6 },
-  toggleBtn: {
-    flex: 1,
-    paddingVertical: 8,
-    borderRadius: 7,
-    borderWidth: 1,
-    borderColor: "#DAD5C4",
+  inputPequeno: {
     backgroundColor: "#FFFFFF",
-    alignItems: "center"
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#E4DCC8",
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    fontSize: 14,
+    color: "#2B2820",
+    width: 90,
+    textAlign: "right"
   },
-  toggleBtnActivo: { backgroundColor: "#2B2820", borderColor: "#2B2820" },
-  toggleTexto: { fontSize: 12.5, color: "#5C5745", fontWeight: "600" },
-  toggleTextoActivo: { color: "#F3F1E7" },
 
-  botonAgregar: {
-    backgroundColor: "#2B2820",
-    borderRadius: 8,
-    paddingVertical: 11,
+  segmentado: {
+    flexDirection: "row",
+    backgroundColor: "#EFEADC",
+    borderRadius: 10,
+    padding: 3,
+    gap: 3
+  },
+  segmentadoBotao: {
+    flex: 1,
+    paddingVertical: 9,
     alignItems: "center",
-    marginTop: 2
+    borderRadius: 8
   },
-  botonAgregarTexto: { color: "#F3F1E7", fontWeight: "700", fontSize: 13 },
+  segmentadoBotaoAtivo: { backgroundColor: "#FFFFFF" },
+  segmentadoBotaoTexto: { fontSize: 13, fontWeight: "700", color: "#8A8270" },
+  segmentadoBotaoTextoAtivo: { color: "#2B2820" },
 
-  totalCaja: {
+  linhaParticipante: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    backgroundColor: "#F7F4EA",
-    borderWidth: 1,
-    borderRadius: 10,
-    padding: 14,
-    marginBottom: 18
+    paddingVertical: 7
   },
-  totalEtiqueta: { fontSize: 12.5, color: "#5C5745" },
-  totalValor: { fontSize: 18, fontWeight: "700" },
-
-  listaGastos: {
-    backgroundColor: "#F7F4EA",
-    borderWidth: 1,
-    borderColor: "#DAD5C4",
-    borderRadius: 10,
-    overflow: "hidden"
-  },
-  listaVacia: { padding: 22, textAlign: "center", fontSize: 12.5, color: "#9B9581" },
-
-  filaGasto: { padding: 10 },
-  filaGastoBorde: { borderBottomWidth: 1, borderBottomColor: "#ECE7D8" },
-  filaGastoTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-  filaGastoIzq: { flexDirection: "row", alignItems: "center", gap: 6, flexShrink: 1, marginRight: 10 },
-  filaGastoDer: { flexDirection: "row", alignItems: "center", gap: 14 },
-  badge: { paddingHorizontal: 7, paddingVertical: 2, borderRadius: 20 },
-  badgeTexto: { fontSize: 10, fontWeight: "700", color: "#F3F1E7" },
-  filaGastoFecha: { fontSize: 11.5, color: "#9B9581" },
-  filaGastoValor: { fontSize: 13.5, fontWeight: "700", color: "#2B2820", marginRight: 2 },
-  botonEliminar: { padding: 6 },
-  filaGastoNota: { fontSize: 11.5, color: "#5C5745", marginTop: 4, lineHeight: 16 },
-
-  filaAcciones: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginBottom: 12 },
-  botonAccionSecundario: {
-    paddingVertical: 7,
-    paddingHorizontal: 10,
-    borderRadius: 7,
-    borderWidth: 1,
-    borderColor: "#DAD5C4",
-    backgroundColor: "#F7F4EA"
-  },
-  botonAccionSecundarioTexto: { fontSize: 11.5, color: "#5C5745", fontWeight: "600" },
-  botonAccionPeligro: {
-    paddingVertical: 7,
-    paddingHorizontal: 10,
-    borderRadius: 7,
-    borderWidth: 1,
-    borderColor: "#E3B8B2",
-    backgroundColor: "#FBEDEB"
-  },
-  botonAccionPeligroTexto: { fontSize: 11.5, color: "#A83B32", fontWeight: "600" },
-
-  filaGastoArchivada: { opacity: 0.55 },
-  etiquetaArchivado: {
-    fontSize: 10,
-    color: "#9B9581",
-    fontStyle: "italic",
-    marginLeft: 4
-  },
-
-  botonFoto: {
-    borderWidth: 1,
-    borderColor: "#DAD5C4",
-    borderRadius: 7,
-    backgroundColor: "#FFFFFF",
-    paddingVertical: 9,
-    alignItems: "center"
-  },
-  botonFotoTexto: { fontSize: 12.5, color: "#5C5745", fontWeight: "600" },
-  previaFotoFila: { flexDirection: "row", alignItems: "center", gap: 10 },
-  previaFoto: {
-    width: 56,
-    height: 56,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: "#DAD5C4"
-  },
-  botonQuitarFoto: {
-    paddingVertical: 6,
-    paddingHorizontal: 10,
-    borderRadius: 7,
-    borderWidth: 1,
-    borderColor: "#E3B8B2",
-    backgroundColor: "#FBEDEB"
-  },
-  botonQuitarFotoTexto: { fontSize: 11.5, color: "#A83B32", fontWeight: "600" },
-
-  iconoFoto: { fontSize: 12, marginLeft: 4, marginRight: 2 },
-
-  modalFondo: {
-    flex: 1,
-    backgroundColor: "rgba(20,18,12,0.92)",
+  linhaParticipanteNome: { flexDirection: "row", alignItems: "center", gap: 10, flex: 1 },
+  linhaParticipanteTexto: { fontSize: 14.5, color: "#2B2820", fontWeight: "600" },
+  caixaSelecao: {
+    width: 20,
+    height: 20,
+    borderRadius: 5,
+    borderWidth: 1.5,
+    borderColor: "#B7AE97",
     alignItems: "center",
-    justifyContent: "center",
-    padding: 24
+    justifyContent: "center"
   },
-  modalImagen: { width: "100%", height: "75%" },
-  modalCerrarBtn: {
-    marginTop: 18,
-    paddingVertical: 10,
-    paddingHorizontal: 20,
-    borderRadius: 8,
-    backgroundColor: "#F3F1E7"
-  },
-  modalCerrarTexto: { color: "#2B2820", fontWeight: "700", fontSize: 13 },
-  containerLock: {
-    alignItems: 'center',
-    marginVertical: 10,
-  },
-  areaBotao: {
-    width: 150,
-  },
-  modalLockFundo: {
+  caixaSelecaoAtiva: { backgroundColor: "#3F6B4F", borderColor: "#3F6B4F" },
+  caixaSelecaoMarca: { color: "#FFFFFF", fontSize: 12, fontWeight: "700" },
+
+  textoAjudaSoma: { fontSize: 12, color: "#8A8270", marginTop: 8 },
+
+  modalBotoes: { flexDirection: "row", gap: 10, marginTop: 20 },
+  modalBotaoSecundario: {
     flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.6)',
-    justifyContent: 'center',
-    alignItems: 'center',
+    paddingVertical: 13,
+    borderRadius: 10,
+    alignItems: "center",
+    backgroundColor: "#EFEADC"
   },
-  modalLockCaja: {
-    width: 280,
-    backgroundColor: '#F7F4EA',
-    borderRadius: 12,
-    padding: 20,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#DAD5C4',
-  },
-  modalLockTitulo: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: '#2B2820',
-    marginBottom: 15,
-  },
-  modalLockInput: {
-    width: '100%',
-    height: 45,
-    backgroundColor: '#FFFFFF',
-    borderWidth: 1,
-    borderColor: '#DAD5C4',
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    textAlign: 'center',
-    fontSize: 16,
-    color: '#2B2820',
-    marginBottom: 20,
-  },
-  modalLockBotoes: {
-    flexDirection: 'row',
-    gap: 10,
-  },
-  modalLockBtn: {
+  modalBotaoSecundarioTexto: { fontWeight: "700", color: "#5C5745" },
+  modalBotaoPrimario: {
     flex: 1,
-    height: 40,
-    borderRadius: 6,
-    justifyContent: 'center',
-    alignItems: 'center',
+    paddingVertical: 13,
+    borderRadius: 10,
+    alignItems: "center",
+    backgroundColor: "#3F6B4F"
   },
-  botaoLockCustom: {
-    width: 45,
-    height: 40,
-    borderRadius: 8,
-    justifyContent: 'center',
-    alignItems: 'center',
-    elevation: 2,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.2,
-    shadowRadius: 1.41,
-  },
-  botaoLockTextoCustom: {
-    color: '#F3F1E7',
-    fontWeight: '700',
-    fontSize: 14,
-    letterSpacing: 0.5,
-  }
+  modalBotaoPrimarioTexto: { fontWeight: "700", color: "#FFFFFF" }
 });
