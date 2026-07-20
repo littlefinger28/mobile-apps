@@ -27,8 +27,9 @@ DONE. build queue and progress 30 min + 10 min
 guardar link
 
 
-2) usar expo
+2) usar expo, criar ou dar update
 
-3) criar app nova
-
-4) dar update na app
+export EXPO_TOKEN=$EXPO_TOKEN
+npx expo whoami
+npx expo start --tunnel
+eas build --platform android --profile preview

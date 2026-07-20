@@ -38,6 +38,31 @@ function esLaborable(anio, mes, dia) {
   return d !== 0 && d !== 6;
 }
 
+const SUELDO_BASE = 1859928;
+
+function diasUtilesDelMes(anio, mes) {
+  const totalDias = new Date(anio, mes + 1, 0).getDate();
+  let cuenta = 0;
+  for (let d = 1; d <= totalDias; d++) {
+    if (esLaborable(anio, mes, d)) cuenta += 1;
+  }
+  return cuenta;
+}
+
+function ultimoDiaISO(anio, mes) {
+  const totalDias = new Date(anio, mes + 1, 0).getDate();
+  return claveDia(anio, mes, totalDias);
+}
+
+// Si el mes elegido todavía no ha ocurrido este año (es posterior al mes actual),
+// se refiere al mismo mes del año anterior.
+function anioParaMesElegido(mesElegido) {
+  const hoy = new Date();
+  const mesActual = hoy.getMonth();
+  const anioActual = hoy.getFullYear();
+  return mesElegido > mesActual ? anioActual - 1 : anioActual;
+}
+
 function siguienteEstado(actual, laborable) {
   const ordenLaborable = ["verde", "naranja", "rojo"];
   const ordenFinde = ["neutro", "verde", "naranja", "rojo"];
@@ -564,6 +589,10 @@ function PanelGastos({ isLocked }) {
   const [mostrarArchivados, setMostrarArchivados] = useState(false);
   const [imagenVisible, setImagenVisible] = useState(null);
 
+  const [tipoRapido, setTipoRapido] = useState("sueldo");
+  const [mesRapido, setMesRapido] = useState(new Date().getMonth());
+  const [calculandoRapido, setCalculandoRapido] = useState(false);
+
   const cargarEntradas = useCallback(async () => {
     try {
       const { data, error } = await supabase
@@ -673,6 +702,103 @@ function PanelGastos({ isLocked }) {
     }
   };
 
+  const agregarEntradaConDatos = async (valorNumero, diaISO, notaTexto) => {
+    const nueva = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      cuenta: CUENTA,
+      tipo: "debe",
+      valor: valorNumero,
+      dia: diaISO,
+      nota: notaTexto,
+      imagen: null,
+      archivado: false
+    };
+    setEntradas((prev) => [nueva, ...prev].sort((a, b) => (a.dia < b.dia ? 1 : -1)));
+    try {
+      const { error } = await supabase.from("gastos").insert(nueva);
+      if (error) throw error;
+    } catch (e) {
+      console.error("Error al guardar entrada rápida:", e);
+    }
+  };
+
+  const calcularYAgregarSueldo = async (mes) => {
+    setCalculandoRapido(true);
+    try {
+      const anio = anioParaMesElegido(mes);
+      const prefijo = `${anio}-${String(mes + 1).padStart(2, "0")}-`;
+      const { data, error } = await supabase
+        .from("dias_estado")
+        .select("clave, estado")
+        .like("clave", `${prefijo}%`);
+      if (error) throw error;
+
+      let naranjaCount = 0;
+      (data || []).forEach((fila) => {
+        const dia = parseInt(fila.clave.split("-")[2], 10);
+        if (fila.estado === "naranja" && esLaborable(anio, mes, dia)) {
+          naranjaCount += 1;
+        }
+      });
+
+      const totalUtiles = diasUtilesDelMes(anio, mes);
+      const diasTrabajados = Math.max(totalUtiles - naranjaCount, 0);
+      const valorNumero = Math.round((SUELDO_BASE * diasTrabajados) / totalUtiles);
+      const diaISO = ultimoDiaISO(anio, mes);
+      const notaTexto = `Sueldo de ${MESES[mes].toLowerCase()}, trabajé ${diasTrabajados} días`;
+
+      await agregarEntradaConDatos(valorNumero, diaISO, notaTexto);
+    } catch (e) {
+      console.error("Error al calcular sueldo:", e);
+      Alert.alert("Error", "No se pudo calcular el sueldo de ese mes.");
+    } finally {
+      setCalculandoRapido(false);
+    }
+  };
+
+  const calcularYAgregarVacaciones = async (mes) => {
+    setCalculandoRapido(true);
+    try {
+      const anio = anioParaMesElegido(mes);
+      const { data, error } = await supabase
+        .from("vacaciones")
+        .select("valor")
+        .eq("anio", anio)
+        .maybeSingle();
+      if (error) throw error;
+
+      const diasVacaciones = data ? data.valor : 34;
+      const valorDiario = SUELDO_BASE / 22;
+      const valorNumero = Math.round(valorDiario * diasVacaciones);
+      const diaISO = hoyISO();
+      const notaTexto = "Vacaciones y festivos";
+
+      await agregarEntradaConDatos(valorNumero, diaISO, notaTexto);
+    } catch (e) {
+      console.error("Error al calcular vacaciones:", e);
+      Alert.alert("Error", "No se pudo calcular las vacaciones y festivos de ese mes.");
+    } finally {
+      setCalculandoRapido(false);
+    }
+  };
+
+  const confirmarEntradaRapida = () => {
+    const anio = anioParaMesElegido(mesRapido);
+    const esVacaciones = tipoRapido === "vacaciones";
+    Alert.alert(
+      "Añadir entrada rápida",
+      `¿Añadir ${esVacaciones ? "vacaciones y festivos" : "sueldo"} de ${MESES[mesRapido]} ${anio}?`,
+      [
+        { text: "Cancelar", style: "cancel" },
+        {
+          text: "Añadir",
+          onPress: () =>
+            esVacaciones ? calcularYAgregarVacaciones(mesRapido) : calcularYAgregarSueldo(mesRapido)
+        }
+      ]
+    );
+  };
+
   const alternarArchivado = async (id) => {
     const entrada = entradas.find((e) => e.id === id);
     if (!entrada) return;
@@ -773,6 +899,61 @@ function PanelGastos({ isLocked }) {
   return (
     <View>
       <Text style={styles.tituloGastos}>Gastos y pagos</Text>
+
+      {!isLocked && (
+        <View style={styles.formCaja}>
+          <Text style={styles.campoEtiqueta}>Entrada rápida</Text>
+
+          <View style={styles.toggleFila}>
+            <TouchableOpacity
+              onPress={() => setTipoRapido("sueldo")}
+              style={[styles.toggleBtn, tipoRapido === "sueldo" && styles.toggleBtnActivo]}
+            >
+              <Text style={[styles.toggleTexto, tipoRapido === "sueldo" && styles.toggleTextoActivo]}>
+                Sueldo mensual
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={() => setTipoRapido("vacaciones")}
+              style={[styles.toggleBtn, tipoRapido === "vacaciones" && styles.toggleBtnActivo]}
+            >
+              <Text style={[styles.toggleTexto, tipoRapido === "vacaciones" && styles.toggleTextoActivo]}>
+                Vacaciones y festivos
+              </Text>
+            </TouchableOpacity>
+          </View>
+
+          <View style={styles.mesesFila}>
+            {MESES.map((nombreMes, i) => (
+              <TouchableOpacity
+                key={nombreMes}
+                onPress={() => setMesRapido(i)}
+                style={[styles.mesChip, mesRapido === i && styles.mesChipActivo]}
+              >
+                <Text style={[styles.mesChipTexto, mesRapido === i && styles.mesChipTextoActivo]}>
+                  {nombreMes.slice(0, 3)}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+
+          <Text style={styles.textoAyuda}>
+            {tipoRapido === "vacaciones"
+              ? `Se añadirá con fecha de hoy (${hoyISO()})`
+              : `Se añadirá con fecha ${ultimoDiaISO(anioParaMesElegido(mesRapido), mesRapido)}`}
+          </Text>
+
+          <TouchableOpacity
+            onPress={confirmarEntradaRapida}
+            style={[styles.botonAgregar, calculandoRapido && { opacity: 0.6 }]}
+            disabled={calculandoRapido}
+          >
+            <Text style={styles.botonAgregarTexto}>
+              {calculandoRapido ? "Calculando..." : "⚡ Calcular y añadir"}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      )}
 
       {!isLocked && (
         <View style={styles.formCaja}>
@@ -1072,6 +1253,25 @@ const styles = StyleSheet.create({
   resumenPunto: { width: 10, height: 10, borderRadius: 3 },
   resumenEtiqueta: { fontSize: 10.5, color: "#9B9581" },
   resumenValor: { fontSize: 18, fontWeight: "700", color: "#2B2820" },
+
+  mesesFila: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 6,
+    marginTop: 10,
+    marginBottom: 4
+  },
+  mesChip: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 7,
+    borderWidth: 1,
+    borderColor: "#DAD5C4",
+    backgroundColor: "#FFFFFF"
+  },
+  mesChipActivo: { backgroundColor: "#2B2820", borderColor: "#2B2820" },
+  mesChipTexto: { fontSize: 12, color: "#5C5745", fontWeight: "600" },
+  mesChipTextoActivo: { color: "#F3F1E7" },
 
   cajaVacaciones: {
     flexDirection: "row",
