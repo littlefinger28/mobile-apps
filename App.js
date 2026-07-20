@@ -38,7 +38,21 @@ function esLaborable(anio, mes, dia) {
   return d !== 0 && d !== 6;
 }
 
-const SUELDO_BASE = 1859928;
+// Sube una foto al bucket de Supabase Storage y devuelve la URL pública.
+async function subirFotoStorage(uriOriginal) {
+  const base64 = await FileSystem.readAsStringAsync(uriOriginal, {
+    encoding: FileSystem.EncodingType.Base64
+  });
+  const nombre = `foto-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.jpg`;
+  const { error } = await supabase.storage
+    .from("fotos")
+    .upload(nombre, decode(base64), { contentType: "image/jpeg" });
+  if (error) throw error;
+  const { data } = supabase.storage.from("fotos").getPublicUrl(nombre);
+  return data.publicUrl;
+}
+
+const SUELDO_BASE = 189928;
 
 function diasUtilesDelMes(anio, mes) {
   const totalDias = new Date(anio, mes + 1, 0).getDate();
@@ -196,6 +210,48 @@ function UnlockApp({ isLocked, setIsLocked }) {
 export default function App() {
   const [pestana, setPestana] = useState("calendario");
   const [isLocked, setIsLocked] = useState(true);
+  const [sueldoBase, setSueldoBase] = useState(SUELDO_BASE);
+
+  useEffect(() => {
+    let activo = true;
+    (async () => {
+      try {
+        const { data, error } = await supabase
+          .from("sueldo_base")
+          .select("valor")
+          .eq("id", 1)
+          .maybeSingle();
+        if (error) throw error;
+        if (activo && data) setSueldoBase(data.valor);
+      } catch (e) {
+        console.error("Error al cargar el sueldo base:", e);
+      }
+    })();
+
+    const canal = supabase
+      .channel("sueldo_base_cambios")
+      .on("postgres_changes", { event: "*", schema: "public", table: "sueldo_base" }, (payload) => {
+        if (payload.new && typeof payload.new.valor !== "undefined") {
+          setSueldoBase(payload.new.valor);
+        }
+      })
+      .subscribe();
+
+    return () => {
+      activo = false;
+      supabase.removeChannel(canal);
+    };
+  }, []);
+
+  const cambiarSueldoBase = async (nuevoValor) => {
+    setSueldoBase(nuevoValor);
+    try {
+      const { error } = await supabase.from("sueldo_base").upsert({ id: 1, valor: nuevoValor });
+      if (error) throw error;
+    } catch (e) {
+      console.error("Error al guardar el sueldo base:", e);
+    }
+  };
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -209,9 +265,9 @@ export default function App() {
         <BarraSuperior pestana={pestana} setPestana={setPestana} />
         
         {pestana === "calendario" ? (
-          <PanelCalendario isLocked={isLocked} />
+          <PanelCalendario isLocked={isLocked} sueldoBase={sueldoBase} onCambiarSueldoBase={cambiarSueldoBase} />
         ) : (
-          <PanelGastos isLocked={isLocked} />
+          <PanelGastos isLocked={isLocked} sueldoBase={sueldoBase} />
         )}
       </ScrollView>
     </SafeAreaView>
@@ -250,13 +306,156 @@ function TabBtn({ activo, onPress, texto }) {
 
 /* ---------------- PANEL CALENDARIO ---------------- */
 
-function PanelCalendario({ isLocked }) {
+function PanelCalendario({ isLocked, sueldoBase, onCambiarSueldoBase }) {
   const hoy = new Date();
   const [anio, setAnio] = useState(hoy.getFullYear());
   const [mes, setMes] = useState(hoy.getMonth());
   const [estados, setEstados] = useState({});
   const [cargado, setCargado] = useState(false);
   const [vacaciones, setVacaciones] = useState(34);
+
+  const [clavesConFoto, setClavesConFoto] = useState({});
+  const [modalFotosVisible, setModalFotosVisible] = useState(false);
+  const [diaFotosClave, setDiaFotosClave] = useState(null);
+  const [fotosDelDia, setFotosDelDia] = useState([]);
+  const [cargandoFotos, setCargandoFotos] = useState(false);
+  const [subiendoFoto, setSubiendoFoto] = useState(false);
+  const [fotoAmpliada, setFotoAmpliada] = useState(null);
+
+  useEffect(() => {
+    let activo = true;
+    (async () => {
+      try {
+        const { data, error } = await supabase.from("dias_fotos").select("clave");
+        if (error) throw error;
+        if (activo && data) {
+          const mapa = {};
+          data.forEach((fila) => { mapa[fila.clave] = (mapa[fila.clave] || 0) + 1; });
+          setClavesConFoto(mapa);
+        }
+      } catch (e) {
+        console.error("Error al cargar fotos de días:", e);
+      }
+    })();
+
+    const canal = supabase
+      .channel("dias_fotos_indicador")
+      .on("postgres_changes", { event: "*", schema: "public", table: "dias_fotos" }, () => {
+        supabase
+          .from("dias_fotos")
+          .select("clave")
+          .then(({ data }) => {
+            if (!activo || !data) return;
+            const mapa = {};
+            data.forEach((fila) => { mapa[fila.clave] = (mapa[fila.clave] || 0) + 1; });
+            setClavesConFoto(mapa);
+          });
+      })
+      .subscribe();
+
+    return () => {
+      activo = false;
+      supabase.removeChannel(canal);
+    };
+  }, []);
+
+  const abrirFotosDia = async (clave) => {
+    setDiaFotosClave(clave);
+    setModalFotosVisible(true);
+    setCargandoFotos(true);
+    try {
+      const { data, error } = await supabase
+        .from("dias_fotos")
+        .select("*")
+        .eq("clave", clave)
+        .order("creado_en", { ascending: false });
+      if (error) throw error;
+      setFotosDelDia(data || []);
+    } catch (e) {
+      console.error("Error al cargar fotos del día:", e);
+      setFotosDelDia([]);
+    } finally {
+      setCargandoFotos(false);
+    }
+  };
+
+  const agregarFotoADia = async (origen) => {
+    if (!diaFotosClave) return;
+    const permiso =
+      origen === "camara"
+        ? await ImagePicker.requestCameraPermissionsAsync()
+        : await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!permiso.granted) {
+      Alert.alert(
+        "Permiso necesario",
+        origen === "camara"
+          ? "Necesitas dar permiso para usar la cámara."
+          : "Necesitas dar permiso para acceder a tus fotos."
+      );
+      return;
+    }
+    const resultado =
+      origen === "camara"
+        ? await ImagePicker.launchCameraAsync({ quality: 0.6 })
+        : await ImagePicker.launchImageLibraryAsync({
+            mediaTypes: ImagePicker.MediaTypeOptions.Images,
+            quality: 0.6
+          });
+    if (resultado.canceled || !resultado.assets || !resultado.assets[0]) return;
+
+    setSubiendoFoto(true);
+    try {
+      const url = await subirFotoStorage(resultado.assets[0].uri);
+      const nuevaFila = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        clave: diaFotosClave,
+        foto: url
+      };
+      setFotosDelDia((prev) => [nuevaFila, ...prev]);
+      setClavesConFoto((prev) => ({ ...prev, [diaFotosClave]: (prev[diaFotosClave] || 0) + 1 }));
+      const { error } = await supabase.from("dias_fotos").insert(nuevaFila);
+      if (error) throw error;
+    } catch (e) {
+      console.error("Error al añadir foto:", e);
+      Alert.alert("Error", "No se pudo añadir la foto.");
+    } finally {
+      setSubiendoFoto(false);
+    }
+  };
+
+  const elegirOrigenFoto = () => {
+    Alert.alert("Añadir foto", "¿De dónde quieres la imagen?", [
+      { text: "Cancelar", style: "cancel" },
+      { text: "Cámara", onPress: () => agregarFotoADia("camara") },
+      { text: "Galería", onPress: () => agregarFotoADia("galeria") }
+    ]);
+  };
+
+  const eliminarFoto = (fila) => {
+    Alert.alert("Eliminar foto", "¿Seguro que quieres eliminar esta foto?", [
+      { text: "Cancelar", style: "cancel" },
+      {
+        text: "Eliminar",
+        style: "destructive",
+        onPress: async () => {
+          setFotosDelDia((prev) => prev.filter((f) => f.id !== fila.id));
+          setClavesConFoto((prev) => {
+            const copia = { ...prev };
+            const restante = (copia[fila.clave] || 1) - 1;
+            if (restante <= 0) delete copia[fila.clave];
+            else copia[fila.clave] = restante;
+            return copia;
+          });
+          try {
+            const { error } = await supabase.from("dias_fotos").delete().eq("id", fila.id);
+            if (error) throw error;
+          } catch (e) {
+            console.error("Error al eliminar foto:", e);
+          }
+        }
+      }
+    ]);
+  };
 
   useEffect(() => {
     let activo = true;
@@ -324,6 +523,12 @@ function PanelCalendario({ isLocked }) {
     } catch (e) {
       console.error("Error al guardar vacaciones:", e);
     }
+  };
+
+  const cambiarSueldo = (texto) => {
+    if (isLocked) return;
+    const numero = texto === "" ? 0 : Number(texto.replace(/[^0-9]/g, ""));
+    onCambiarSueldoBase(numero);
   };
 
   const alternarDia = async (dia) => {
@@ -473,6 +678,8 @@ function PanelCalendario({ isLocked }) {
             <TouchableOpacity
               key={clave}
               onPress={() => alternarDia(dia)}
+              onLongPress={() => abrirFotosDia(clave)}
+              delayLongPress={350}
               style={[
                 styles.celdaDia,
                 { backgroundColor: color.bg, borderColor: esHoy ? "#2B2820" : color.ring, borderWidth: esHoy ? 2 : 1 }
@@ -481,6 +688,7 @@ function PanelCalendario({ isLocked }) {
               <Text style={{ color: color.fg, fontWeight: esHoy ? "700" : "500", fontSize: 14 }}>
                 {dia}
               </Text>
+              {!!clavesConFoto[clave] && <Text style={styles.indicadorFoto}>📷</Text>}
             </TouchableOpacity>
           );
         })}
@@ -492,7 +700,7 @@ function PanelCalendario({ isLocked }) {
         <Leyenda color={COLORES.rojo.bg} texto={`Médico (${conteos.rojo})`} />
       </View>
 
-      <Text style={styles.textoAyuda}>Clica en el día para cambiar el estado.</Text>
+      <Text style={styles.textoAyuda}>Clica en el día para cambiar el estado. Mantén pulsado para ver/añadir fotos.</Text>
 
       <View style={styles.filaResumen}>
         <ResumenAnual
@@ -513,6 +721,18 @@ function PanelCalendario({ isLocked }) {
           style={styles.inputVacaciones}
         />
       </View>
+
+      <View style={styles.cajaVacaciones}>
+        <Text style={styles.cajaVacacionesTexto}>Sueldo mensual</Text>
+        <TextInput
+          value={String(sueldoBase)}
+          onChangeText={cambiarSueldo}
+          keyboardType="number-pad"
+          editable={!isLocked}
+          style={[styles.inputVacaciones, isLocked && styles.inputBloqueado]}
+        />
+      </View>
+      {isLocked && <Text style={styles.textoAyuda}>🔒 Desbloquea la app para editar el sueldo.</Text>}
 
       {excedenteMes > 0 && (
         <View style={styles.cajaExceso}>
@@ -546,6 +766,93 @@ function PanelCalendario({ isLocked }) {
           ))}
         </View>
       )}
+
+      <Modal
+        visible={modalFotosVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setModalFotosVisible(false)}
+      >
+        <TouchableOpacity
+          style={styles.modalLockFundo}
+          activeOpacity={1}
+          onPress={() => setModalFotosVisible(false)}
+        >
+          <TouchableOpacity activeOpacity={1} style={styles.cajaModalFotos} onPress={() => {}}>
+            <View style={styles.cabeceraModalFotos}>
+              <Text style={styles.modalLockTitulo}>{diaFotosClave}</Text>
+              <TouchableOpacity onPress={() => setModalFotosVisible(false)} style={styles.botonXFotos}>
+                <Text style={styles.botonXFotosTexto}>✕</Text>
+              </TouchableOpacity>
+            </View>
+
+            {!isLocked && (
+              <TouchableOpacity
+                onPress={elegirOrigenFoto}
+                style={[styles.botonAgregar, subiendoFoto && { opacity: 0.6 }]}
+                disabled={subiendoFoto}
+              >
+                <Text style={styles.botonAgregarTexto}>
+                  {subiendoFoto ? "Subiendo..." : "📷 Añadir foto"}
+                </Text>
+              </TouchableOpacity>
+            )}
+
+            {cargandoFotos ? (
+              <Text style={styles.textoAyuda}>Cargando fotos...</Text>
+            ) : fotosDelDia.length === 0 ? (
+              <Text style={styles.textoAyuda}>Todavía no hay fotos para este día.</Text>
+            ) : (
+              <ScrollView style={styles.scrollFotos}>
+                <View style={styles.grillaFotos}>
+                  {fotosDelDia.map((f) => (
+                    <View key={f.id} style={styles.miniFotoWrap}>
+                      <TouchableOpacity onPress={() => setFotoAmpliada(f.foto)}>
+                        <Image source={{ uri: f.foto }} style={styles.miniFoto} />
+                      </TouchableOpacity>
+                      {!isLocked && (
+                        <TouchableOpacity
+                          onPress={() => eliminarFoto(f)}
+                          style={styles.botonXMiniFoto}
+                        >
+                          <Text style={styles.botonXMiniFotoTexto}>✕</Text>
+                        </TouchableOpacity>
+                      )}
+                    </View>
+                  ))}
+                </View>
+              </ScrollView>
+            )}
+
+            <TouchableOpacity
+              onPress={() => setModalFotosVisible(false)}
+              style={[styles.modalLockBtn, { backgroundColor: "#DAD5C4", marginTop: 14 }]}
+            >
+              <Text style={{ color: "#2B2820", fontWeight: "600" }}>Cerrar</Text>
+            </TouchableOpacity>
+          </TouchableOpacity>
+        </TouchableOpacity>
+      </Modal>
+
+      <Modal
+        visible={!!fotoAmpliada}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setFotoAmpliada(null)}
+      >
+        <TouchableOpacity
+          style={styles.modalFondo}
+          activeOpacity={1}
+          onPress={() => setFotoAmpliada(null)}
+        >
+          {!!fotoAmpliada && (
+            <Image source={{ uri: fotoAmpliada }} style={styles.modalImagen} resizeMode="contain" />
+          )}
+          <TouchableOpacity onPress={() => setFotoAmpliada(null)} style={styles.modalCerrarBtn}>
+            <Text style={styles.modalCerrarTexto}>Cerrar</Text>
+          </TouchableOpacity>
+        </TouchableOpacity>
+      </Modal>
     </View>
   );
 }
@@ -579,7 +886,7 @@ const TIPOS = [
   { valor: "pago", etiqueta: "Pagó" }
 ];
 
-function PanelGastos({ isLocked }) {
+function PanelGastos({ isLocked, sueldoBase }) {
   const [entradas, setEntradas] = useState([]);
   const [tipo, setTipo] = useState("debe");
   const [valor, setValor] = useState("");
@@ -743,7 +1050,7 @@ function PanelGastos({ isLocked }) {
 
       const totalUtiles = diasUtilesDelMes(anio, mes);
       const diasTrabajados = Math.max(totalUtiles - naranjaCount, 0);
-      const valorNumero = Math.round((SUELDO_BASE * diasTrabajados) / totalUtiles);
+      const valorNumero = Math.round((sueldoBase * diasTrabajados) / totalUtiles);
       const diaISO = ultimoDiaISO(anio, mes);
       const notaTexto = `Sueldo de ${MESES[mes].toLowerCase()}, trabajé ${diasTrabajados} días`;
 
@@ -768,7 +1075,7 @@ function PanelGastos({ isLocked }) {
       if (error) throw error;
 
       const diasVacaciones = data ? data.valor : 34;
-      const valorDiario = SUELDO_BASE / 22;
+      const valorDiario = sueldoBase / 22;
       const valorNumero = Math.round(valorDiario * diasVacaciones);
       const diaISO = hoyISO();
       const notaTexto = "Vacaciones y festivos";
@@ -1230,6 +1537,70 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     marginVertical: 3
   },
+  indicadorFoto: {
+    position: "absolute",
+    bottom: 2,
+    right: 4,
+    fontSize: 9
+  },
+  cajaModalFotos: {
+    width: "100%",
+    maxWidth: 340,
+    maxHeight: "80%",
+    backgroundColor: "#F7F4EA",
+    borderRadius: 12,
+    padding: 20,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "#DAD5C4"
+  },
+  cabeceraModalFotos: {
+    width: "100%",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 15,
+    position: "relative"
+  },
+  botonXFotos: {
+    position: "absolute",
+    right: 0,
+    top: -4,
+    padding: 6
+  },
+  botonXFotosTexto: { fontSize: 16, color: "#5C5745", fontWeight: "700" },
+  scrollFotos: { width: "100%", maxHeight: 320, marginTop: 6 },
+  grillaFotos: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    justifyContent: "flex-start"
+  },
+  miniFoto: {
+    width: 90,
+    height: 90,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#DAD5C4"
+  },
+  miniFotoWrap: {
+    width: 90,
+    height: 90
+  },
+  botonXMiniFoto: {
+    position: "absolute",
+    top: -6,
+    right: -6,
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: "#A83B32",
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1.5,
+    borderColor: "#F7F4EA"
+  },
+  botonXMiniFotoTexto: { color: "#F7F4EA", fontSize: 11, fontWeight: "700" },
 
   leyendaFila: { flexDirection: "row", flexWrap: "wrap", gap: 14, marginTop: 18 },
   leyendaItem: { flexDirection: "row", alignItems: "center", gap: 6 },
@@ -1285,6 +1656,7 @@ const styles = StyleSheet.create({
     borderRadius: 10
   },
   cajaVacacionesTexto: { fontSize: 13, color: "#5C5745" },
+  inputBloqueado: { opacity: 0.5 },
   inputVacaciones: {
     width: 64,
     textAlign: "center",
