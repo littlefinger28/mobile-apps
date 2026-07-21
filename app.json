@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "contas-partilhadas",
-    "slug": "contas-partilhadas",
+    "name": "split-bills",
+    "slug": "split-bills",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -22,10 +22,15 @@
       },
       "edgeToEdgeEnabled": true,
       "permissions": [],
-      "package": "com.littlefinger28.contasPartilhadas"
+      "package": "com.littlefinger28.splitBills"
     },
     "web": {
       "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "f0fdac44-da80-4f13-b0dd-c9c601baa683"
+      }
     }
   }
 }

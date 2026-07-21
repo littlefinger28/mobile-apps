@@ -123,6 +123,7 @@ function TelaGrupos({ onAbrirGrupo }) {
   const [carregado, setCarregado] = useState(false);
   const [modalVisivel, setModalVisivel] = useState(false);
   const [nomeNovoGrupo, setNomeNovoGrupo] = useState("");
+  const [mostrarArquivados, setMostrarArquivados] = useState(false);
 
   const carregarGrupos = useCallback(async () => {
     try {
@@ -169,6 +170,8 @@ function TelaGrupos({ onAbrirGrupo }) {
     }
   };
 
+  const gruposVisiveis = grupos.filter((g) => !!g.archivado === mostrarArquivados);
+
   return (
     <View style={styles.flex1}>
       <View style={styles.cabecalho}>
@@ -176,10 +179,12 @@ function TelaGrupos({ onAbrirGrupo }) {
       </View>
 
       <ScrollView contentContainerStyle={styles.listaGruposContainer}>
-        {carregado && grupos.length === 0 && (
-          <Text style={styles.textoVazio}>Ainda não há grupos. Cria o primeiro!</Text>
+        {carregado && gruposVisiveis.length === 0 && (
+          <Text style={styles.textoVazio}>
+            {mostrarArquivados ? "Sem grupos arquivados." : "Ainda não há grupos. Cria o primeiro!"}
+          </Text>
         )}
-        {grupos.map((g) => (
+        {gruposVisiveis.map((g) => (
           <TouchableOpacity
             key={g.id}
             style={styles.cartaoGrupo}
@@ -189,6 +194,14 @@ function TelaGrupos({ onAbrirGrupo }) {
             <Text style={styles.cartaoGrupoSeta}>›</Text>
           </TouchableOpacity>
         ))}
+
+        {grupos.some((g) => g.archivado) && (
+          <TouchableOpacity onPress={() => setMostrarArquivados((v) => !v)}>
+            <Text style={styles.seccaoAcao}>
+              {mostrarArquivados ? "Ver grupos ativos" : "Ver grupos arquivados"}
+            </Text>
+          </TouchableOpacity>
+        )}
       </ScrollView>
 
       <TouchableOpacity style={styles.botaoFlutuante} onPress={() => setModalVisivel(true)}>
@@ -239,6 +252,9 @@ function TelaGrupo({ grupo, deviceId, onVoltar }) {
   const [modalDespesaVisivel, setModalDespesaVisivel] = useState(false);
   const [despesaEditar, setDespesaEditar] = useState(null);
   const [mostrarArquivadas, setMostrarArquivadas] = useState(false);
+  const [modalRenomearVisivel, setModalRenomearVisivel] = useState(false);
+  const [nomeAtual, setNomeAtual] = useState(grupo.nome);
+  const [nomeEditado, setNomeEditado] = useState(grupo.nome);
 
   const carregarPessoas = useCallback(async () => {
     try {
@@ -363,34 +379,77 @@ function TelaGrupo({ grupo, deviceId, onVoltar }) {
                 valor: t.valor
               });
               if (erroDivisao) throw erroDivisao;
-
-              // Se este pagamento saldar tudo, arquiva o histórico do grupo
-              // (fica guardado, mas deixa de contar para as contas futuras).
-              const despesasComPagamento = [
-                ...despesas,
-                { ...novaDespesa, despesas_divisao: [{ pessoa_id: t.para, valor: t.valor }] }
-              ];
-              const saldosNovos = {};
-              pessoas.forEach((p) => {
-                saldosNovos[p.id] = 0;
-              });
-              despesasComPagamento.forEach((d) => {
-                if (d.archivado) return;
-                saldosNovos[d.pago_por] = (saldosNovos[d.pago_por] || 0) + Number(d.valor);
-                (d.despesas_divisao || []).forEach((div) => {
-                  saldosNovos[div.pessoa_id] = (saldosNovos[div.pessoa_id] || 0) - Number(div.valor);
-                });
-              });
-              if (simplificarDividas(saldosNovos).length === 0) {
-                await supabase
-                  .from("despesas")
-                  .update({ archivado: true })
-                  .eq("grupo_id", grupo.id)
-                  .eq("archivado", false);
-              }
             } catch (e) {
               console.error("Erro ao registar pagamento:", e);
               Alert.alert("Erro", "Não foi possível registar o pagamento.");
+            }
+          }
+        }
+      ]
+    );
+  };
+
+  // Sempre que as despesas mudam (novo pagamento, edição, remoção...), verifica
+  // se as contas do grupo ficaram todas a zero — se sim, arquiva o histórico.
+  useEffect(() => {
+    const temDespesasAtivas = despesas.some((d) => !d.archivado);
+    if (temDespesasAtivas && transacoes.length === 0) {
+      supabase
+        .from("despesas")
+        .update({ archivado: true })
+        .eq("grupo_id", grupo.id)
+        .eq("archivado", false)
+        .then(({ error }) => {
+          if (error) console.error("Erro ao arquivar despesas:", error);
+        });
+    }
+  }, [despesas, transacoes, grupo.id]);
+
+  const renomearGrupo = () => {
+    const nome = nomeEditado.trim();
+    if (!nome || nome === nomeAtual) {
+      setModalRenomearVisivel(false);
+      return;
+    }
+    Alert.alert("Confirmar alteração", `Mudar o nome do grupo para "${nome}"?`, [
+      { text: "Cancelar", style: "cancel" },
+      {
+        text: "OK",
+        onPress: async () => {
+          try {
+            const { error } = await supabase.from("grupos").update({ nome }).eq("id", grupo.id);
+            if (error) throw error;
+            setNomeAtual(nome);
+            setModalRenomearVisivel(false);
+          } catch (e) {
+            console.error("Erro ao renomear grupo:", e);
+            Alert.alert("Erro", "Não foi possível renomear o grupo.");
+          }
+        }
+      }
+    ]);
+  };
+
+  const arquivarGrupo = () => {
+    Alert.alert(
+      "Arquivar grupo",
+      `Tens a certeza que queres arquivar "${nomeAtual}"? Deixa de aparecer na lista principal, mas os dados não se perdem.`,
+      [
+        { text: "Cancelar", style: "cancel" },
+        {
+          text: "Arquivar",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              const { error } = await supabase
+                .from("grupos")
+                .update({ archivado: true })
+                .eq("id", grupo.id);
+              if (error) throw error;
+              onVoltar();
+            } catch (e) {
+              console.error("Erro ao arquivar grupo:", e);
+              Alert.alert("Erro", "Não foi possível arquivar o grupo.");
             }
           }
         }
@@ -424,8 +483,21 @@ function TelaGrupo({ grupo, deviceId, onVoltar }) {
           <Text style={styles.botaoVoltarTexto}>‹ Grupos</Text>
         </TouchableOpacity>
         <Text style={styles.tituloGrupo} numberOfLines={1}>
-          {grupo.nome}
+          {nomeAtual}
         </Text>
+        <View style={styles.cabecalhoGrupoAcoes}>
+          <TouchableOpacity
+            onPress={() => {
+              setNomeEditado(nomeAtual);
+              setModalRenomearVisivel(true);
+            }}
+          >
+            <Text style={styles.seccaoAcao}>Editar</Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={arquivarGrupo}>
+            <Text style={[styles.seccaoAcao, styles.itemDespesaBotaoApagar]}>Arquivar</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
       <ScrollView contentContainerStyle={styles.conteudoScroll}>
@@ -535,6 +607,36 @@ function TelaGrupo({ grupo, deviceId, onVoltar }) {
           )}
         </View>
       </ScrollView>
+
+      <Modal visible={modalRenomearVisivel} transparent animationType="fade">
+        <KeyboardAvoidingView
+          behavior={Platform.OS === "ios" ? "padding" : undefined}
+          style={styles.modalFundo}
+        >
+          <View style={styles.modalCaixa}>
+            <Text style={styles.modalTitulo}>Editar nome do grupo</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="Nome do grupo"
+              placeholderTextColor="#9C9484"
+              value={nomeEditado}
+              onChangeText={setNomeEditado}
+              autoFocus
+            />
+            <View style={styles.modalBotoes}>
+              <TouchableOpacity
+                style={styles.modalBotaoSecundario}
+                onPress={() => setModalRenomearVisivel(false)}
+              >
+                <Text style={styles.modalBotaoSecundarioTexto}>Cancelar</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.modalBotaoPrimario} onPress={renomearGrupo}>
+                <Text style={styles.modalBotaoPrimarioTexto}>Guardar</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
 
       <Modal visible={modalPessoaVisivel} transparent animationType="fade">
         <KeyboardAvoidingView
@@ -960,7 +1062,8 @@ const styles = StyleSheet.create({
   },
   botaoVoltar: { paddingVertical: 4, paddingRight: 4 },
   botaoVoltarTexto: { color: "#3F6B4F", fontSize: 15, fontWeight: "600" },
-  tituloGrupo: { fontSize: 19, fontWeight: "700", color: "#2B2820", flexShrink: 1 },
+  tituloGrupo: { fontSize: 19, fontWeight: "700", color: "#2B2820", flexShrink: 1, flex: 1 },
+  cabecalhoGrupoAcoes: { flexDirection: "row", gap: 14 },
 
   conteudoScroll: { paddingHorizontal: 20, paddingBottom: 100, gap: 18 },
 
