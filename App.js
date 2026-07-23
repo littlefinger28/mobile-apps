@@ -39,6 +39,11 @@ function formatoMoeda(valor) {
   return `${sinal}${inteiro},${partes[1]}€`;
 }
 
+function erroDeRede(e) {
+  const texto = `${e?.message || ""} ${e?.details || ""}`.toLowerCase();
+  return texto.includes("network") || texto.includes("failed to fetch");
+}
+
 function hojeISO() {
   const d = new Date();
   const mes = String(d.getMonth() + 1).padStart(2, "0");
@@ -90,6 +95,61 @@ function dividirIgual(total, participantesIds) {
   return resultado;
 }
 
+// Aplica a fila de ações offline (criar/editar/apagar) por cima da última
+// lista conhecida do servidor, para a vista atual refletir sempre o que o
+// utilizador fez, mesmo sem ligação.
+function aplicarFila(despesasBase, fila) {
+  let resultado = [...despesasBase];
+  fila.forEach((acao) => {
+    if (acao.tipo === "criar") {
+      resultado = [{ ...acao.despesa, pendente: true }, ...resultado];
+    } else if (acao.tipo === "editar") {
+      resultado = resultado.map((d) =>
+        d.id === acao.despesa.id ? { ...d, ...acao.despesa, pendenteEdicao: true } : d
+      );
+    } else if (acao.tipo === "apagar") {
+      resultado = resultado.filter((d) => d.id !== acao.despesaId);
+    }
+  });
+  return resultado;
+}
+
+// Junta uma nova ação à fila, simplificando quando possível: editar/apagar
+// algo que ainda nem tinha sincronizado não precisa de ficar como 2 ações.
+function atualizarFila(filaAtual, novaAcao) {
+  if (novaAcao.tipo === "apagar") {
+    const criacaoPendente = filaAtual.find(
+      (a) => a.tipo === "criar" && a.despesa.id === novaAcao.despesaId
+    );
+    if (criacaoPendente) {
+      // Nunca chegou a existir no servidor: só remove a criação da fila.
+      return filaAtual.filter((a) => a !== criacaoPendente);
+    }
+    return [
+      ...filaAtual.filter((a) => !(a.tipo === "editar" && a.despesa.id === novaAcao.despesaId)),
+      novaAcao
+    ];
+  }
+  if (novaAcao.tipo === "editar") {
+    const criacaoPendente = filaAtual.find(
+      (a) => a.tipo === "criar" && a.despesa.id === novaAcao.despesa.id
+    );
+    if (criacaoPendente) {
+      return filaAtual.map((a) =>
+        a === criacaoPendente ? { ...a, despesa: { ...a.despesa, ...novaAcao.despesa } } : a
+      );
+    }
+    const edicaoPendente = filaAtual.find(
+      (a) => a.tipo === "editar" && a.despesa.id === novaAcao.despesa.id
+    );
+    if (edicaoPendente) {
+      return filaAtual.map((a) => (a === edicaoPendente ? novaAcao : a));
+    }
+    return [...filaAtual, novaAcao];
+  }
+  return [...filaAtual, novaAcao];
+}
+
 export default function App() {
   const [deviceId, setDeviceId] = useState(null);
   const [grupoAberto, setGrupoAberto] = useState(null);
@@ -125,6 +185,16 @@ function TelaGrupos({ onAbrirGrupo }) {
   const [nomeNovoGrupo, setNomeNovoGrupo] = useState("");
   const [mostrarArquivados, setMostrarArquivados] = useState(false);
 
+  const chaveCacheGrupos = "cache-grupos";
+
+  useEffect(() => {
+    AsyncStorage.getItem(chaveCacheGrupos)
+      .then((v) => {
+        if (v) setGrupos(JSON.parse(v));
+      })
+      .catch(() => {});
+  }, []);
+
   const carregarGrupos = useCallback(async () => {
     try {
       const { data, error } = await supabase
@@ -132,9 +202,12 @@ function TelaGrupos({ onAbrirGrupo }) {
         .select("*")
         .order("created_at", { ascending: false });
       if (error) throw error;
-      if (data) setGrupos(data);
+      if (data) {
+        setGrupos(data);
+        AsyncStorage.setItem(chaveCacheGrupos, JSON.stringify(data)).catch(() => {});
+      }
     } catch (e) {
-      console.error("Erro ao carregar grupos:", e);
+      console.error("Erro ao carregar grupos (offline?):", e);
     } finally {
       setCarregado(true);
     }
@@ -255,6 +328,123 @@ function TelaGrupo({ grupo, deviceId, onVoltar }) {
   const [modalRenomearVisivel, setModalRenomearVisivel] = useState(false);
   const [nomeAtual, setNomeAtual] = useState(grupo.nome);
   const [nomeEditado, setNomeEditado] = useState(grupo.nome);
+  const [filaAcoes, setFilaAcoes] = useState([]);
+  const [filaPessoas, setFilaPessoas] = useState([]);
+
+  const chaveFila = `fila-acoes-${grupo.id}`;
+  const chaveFilaPessoas = `fila-pessoas-${grupo.id}`;
+  const chaveCacheDespesas = `cache-despesas-${grupo.id}`;
+  const chaveCachePessoas = `cache-pessoas-${grupo.id}`;
+
+  // Carrega a última cópia conhecida (cache) logo ao abrir o grupo, para a
+  // app mostrar o histórico mesmo sem internet, antes de tentar atualizar.
+  useEffect(() => {
+    (async () => {
+      try {
+        const cacheD = await AsyncStorage.getItem(chaveCacheDespesas);
+        if (cacheD) setDespesas(JSON.parse(cacheD));
+        const cacheP = await AsyncStorage.getItem(chaveCachePessoas);
+        if (cacheP) setPessoas(JSON.parse(cacheP));
+        const fila = await AsyncStorage.getItem(chaveFila);
+        if (fila) setFilaAcoes(JSON.parse(fila));
+        const filaP = await AsyncStorage.getItem(chaveFilaPessoas);
+        if (filaP) setFilaPessoas(JSON.parse(filaP));
+      } catch (e) {
+        console.error("Erro ao carregar cache local:", e);
+      }
+    })();
+  }, [chaveCacheDespesas, chaveCachePessoas, chaveFila, chaveFilaPessoas]);
+
+  const enfileirarAcao = useCallback(
+    (novaAcao) => {
+      setFilaAcoes((prev) => {
+        const nova = atualizarFila(prev, novaAcao);
+        AsyncStorage.setItem(chaveFila, JSON.stringify(nova)).catch(() => {});
+        return nova;
+      });
+    },
+    [chaveFila]
+  );
+
+  const sincronizarFila = useCallback(async () => {
+    if (filaAcoes.length === 0) return;
+    let restante = [...filaAcoes];
+    let algumSucesso = false;
+    for (const acao of filaAcoes) {
+      try {
+        if (acao.tipo === "criar") {
+          const { data: nova, error } = await supabase
+            .from("despesas")
+            .insert({
+              grupo_id: acao.despesa.grupo_id,
+              descricao: acao.despesa.descricao,
+              valor: acao.despesa.valor,
+              pago_por: acao.despesa.pago_por,
+              tipo_divisao: acao.despesa.tipo_divisao,
+              data: acao.despesa.data,
+              criado_por: acao.despesa.criado_por,
+              archivado: acao.despesa.archivado
+            })
+            .select()
+            .single();
+          if (error) throw error;
+          const linhas = (acao.despesa.despesas_divisao || []).map((d) => ({
+            despesa_id: nova.id,
+            grupo_id: grupo.id,
+            pessoa_id: d.pessoa_id,
+            valor: d.valor
+          }));
+          if (linhas.length > 0) {
+            const { error: e2 } = await supabase.from("despesas_divisao").insert(linhas);
+            if (e2) throw e2;
+          }
+        } else if (acao.tipo === "editar") {
+          const { error } = await supabase
+            .from("despesas")
+            .update({
+              descricao: acao.despesa.descricao,
+              valor: acao.despesa.valor,
+              pago_por: acao.despesa.pago_por,
+              tipo_divisao: acao.despesa.tipo_divisao,
+              data: acao.despesa.data
+            })
+            .eq("id", acao.despesa.id);
+          if (error) throw error;
+          await supabase.from("despesas_divisao").delete().eq("despesa_id", acao.despesa.id);
+          const linhas = (acao.despesa.despesas_divisao || []).map((d) => ({
+            despesa_id: acao.despesa.id,
+            grupo_id: grupo.id,
+            pessoa_id: d.pessoa_id,
+            valor: d.valor
+          }));
+          if (linhas.length > 0) {
+            const { error: e2 } = await supabase.from("despesas_divisao").insert(linhas);
+            if (e2) throw e2;
+          }
+        } else if (acao.tipo === "apagar") {
+          const { error } = await supabase.from("despesas").delete().eq("id", acao.despesaId);
+          if (error) throw error;
+        }
+        restante = restante.filter((a) => a !== acao);
+        algumSucesso = true;
+      } catch (e) {
+        break;
+      }
+    }
+    if (restante.length !== filaAcoes.length) {
+      setFilaAcoes(restante);
+      AsyncStorage.setItem(chaveFila, JSON.stringify(restante)).catch(() => {});
+    }
+    if (algumSucesso) {
+      carregarDespesas();
+    }
+  }, [filaAcoes, grupo.id, chaveFila]);
+
+  useEffect(() => {
+    sincronizarFila();
+    const intervalo = setInterval(sincronizarFila, 10000);
+    return () => clearInterval(intervalo);
+  }, [sincronizarFila]);
 
   const carregarPessoas = useCallback(async () => {
     try {
@@ -264,11 +454,57 @@ function TelaGrupo({ grupo, deviceId, onVoltar }) {
         .eq("grupo_id", grupo.id)
         .order("created_at", { ascending: true });
       if (error) throw error;
-      if (data) setPessoas(data);
+      if (data) {
+        setPessoas(data);
+        AsyncStorage.setItem(chaveCachePessoas, JSON.stringify(data)).catch(() => {});
+      }
     } catch (e) {
-      console.error("Erro ao carregar pessoas:", e);
+      console.error("Erro ao carregar pessoas (offline?):", e);
     }
-  }, [grupo.id]);
+  }, [grupo.id, chaveCachePessoas]);
+
+  const enfileirarPessoa = useCallback(
+    (nome) => {
+      const pessoaLocal = { id: `local-${gerarId()}`, grupo_id: grupo.id, nome, pendente: true };
+      setFilaPessoas((prev) => {
+        const nova = [...prev, pessoaLocal];
+        AsyncStorage.setItem(chaveFilaPessoas, JSON.stringify(nova)).catch(() => {});
+        return nova;
+      });
+    },
+    [grupo.id, chaveFilaPessoas]
+  );
+
+  const sincronizarPessoas = useCallback(async () => {
+    if (filaPessoas.length === 0) return;
+    let restante = [...filaPessoas];
+    let algumSucesso = false;
+    for (const p of filaPessoas) {
+      try {
+        const { error } = await supabase
+          .from("pessoas")
+          .insert({ grupo_id: p.grupo_id, nome: p.nome });
+        if (error) throw error;
+        restante = restante.filter((r) => r !== p);
+        algumSucesso = true;
+      } catch (e) {
+        break;
+      }
+    }
+    if (restante.length !== filaPessoas.length) {
+      setFilaPessoas(restante);
+      AsyncStorage.setItem(chaveFilaPessoas, JSON.stringify(restante)).catch(() => {});
+    }
+    if (algumSucesso) {
+      carregarPessoas();
+    }
+  }, [filaPessoas, chaveFilaPessoas, carregarPessoas]);
+
+  useEffect(() => {
+    sincronizarPessoas();
+    const intervalo = setInterval(sincronizarPessoas, 10000);
+    return () => clearInterval(intervalo);
+  }, [sincronizarPessoas]);
 
   const carregarDespesas = useCallback(async () => {
     try {
@@ -279,11 +515,14 @@ function TelaGrupo({ grupo, deviceId, onVoltar }) {
         .order("data", { ascending: false })
         .order("created_at", { ascending: false });
       if (error) throw error;
-      if (data) setDespesas(data);
+      if (data) {
+        setDespesas(data);
+        AsyncStorage.setItem(chaveCacheDespesas, JSON.stringify(data)).catch(() => {});
+      }
     } catch (e) {
-      console.error("Erro ao carregar despesas:", e);
+      console.error("Erro ao carregar despesas (offline?):", e);
     }
-  }, [grupo.id]);
+  }, [grupo.id, chaveCacheDespesas]);
 
   useEffect(() => {
     carregarPessoas();
@@ -311,17 +550,27 @@ function TelaGrupo({ grupo, deviceId, onVoltar }) {
     return () => supabase.removeChannel(canal);
   }, [grupo.id, carregarPessoas, carregarDespesas]);
 
+  const pessoasCombinadas = useMemo(
+    () => [...pessoas, ...filaPessoas],
+    [pessoas, filaPessoas]
+  );
+
   const nomePessoa = useCallback(
-    (id) => pessoas.find((p) => p.id === id)?.nome || "Alguém",
-    [pessoas]
+    (id) => pessoasCombinadas.find((p) => p.id === id)?.nome || "Alguém",
+    [pessoasCombinadas]
+  );
+
+  const despesasCombinadas = useMemo(
+    () => aplicarFila(despesas, filaAcoes),
+    [despesas, filaAcoes]
   );
 
   const saldos = useMemo(() => {
     const s = {};
-    pessoas.forEach((p) => {
+    pessoasCombinadas.forEach((p) => {
       s[p.id] = 0;
     });
-    despesas.forEach((d) => {
+    despesasCombinadas.forEach((d) => {
       if (d.archivado) return;
       s[d.pago_por] = (s[d.pago_por] || 0) + Number(d.valor);
       (d.despesas_divisao || []).forEach((div) => {
@@ -329,7 +578,7 @@ function TelaGrupo({ grupo, deviceId, onVoltar }) {
       });
     });
     return s;
-  }, [pessoas, despesas]);
+  }, [pessoasCombinadas, despesasCombinadas]);
 
   const transacoes = useMemo(() => simplificarDividas(saldos), [saldos]);
 
@@ -342,6 +591,16 @@ function TelaGrupo({ grupo, deviceId, onVoltar }) {
       setNomeNovaPessoa("");
       setModalPessoaVisivel(false);
     } catch (e) {
+      if (erroDeRede(e)) {
+        enfileirarPessoa(nome);
+        setNomeNovaPessoa("");
+        setModalPessoaVisivel(false);
+        Alert.alert(
+          "Sem ligação",
+          "A pessoa foi guardada no telemóvel e vai sincronizar quando tiveres internet."
+        );
+        return;
+      }
       console.error("Erro ao adicionar pessoa:", e);
       Alert.alert("Erro", "Não foi possível adicionar a pessoa.");
     }
@@ -380,6 +639,28 @@ function TelaGrupo({ grupo, deviceId, onVoltar }) {
               });
               if (erroDivisao) throw erroDivisao;
             } catch (e) {
+              if (erroDeRede(e)) {
+                enfileirarAcao({
+                  tipo: "criar",
+                  despesa: {
+                    id: `local-${gerarId()}`,
+                    grupo_id: grupo.id,
+                    descricao: "Pagamento",
+                    valor: t.valor,
+                    pago_por: t.de,
+                    tipo_divisao: "valores",
+                    data: hojeISO(),
+                    criado_por: deviceId,
+                    archivado: false,
+                    despesas_divisao: [{ pessoa_id: t.para, valor: t.valor }]
+                  }
+                });
+                Alert.alert(
+                  "Sem ligação",
+                  "O pagamento foi guardado no telemóvel e vai sincronizar quando tiveres internet."
+                );
+                return;
+              }
               console.error("Erro ao registar pagamento:", e);
               Alert.alert("Erro", "Não foi possível registar o pagamento.");
             }
@@ -390,10 +671,11 @@ function TelaGrupo({ grupo, deviceId, onVoltar }) {
   };
 
   // Sempre que as despesas mudam (novo pagamento, edição, remoção...), verifica
-  // se as contas do grupo ficaram todas a zero — se sim, arquiva o histórico.
+  // se as contas do grupo ficaram todas a zero — se sim, arquiva o histórico
+  // (só das pessoas/grupo não mexe, só nas despesas).
   useEffect(() => {
-    const temDespesasAtivas = despesas.some((d) => !d.archivado);
-    if (temDespesasAtivas && transacoes.length === 0) {
+    const temAtivas = despesasCombinadas.some((d) => !d.archivado);
+    if (temAtivas && transacoes.length === 0) {
       supabase
         .from("despesas")
         .update({ archivado: true })
@@ -402,8 +684,20 @@ function TelaGrupo({ grupo, deviceId, onVoltar }) {
         .then(({ error }) => {
           if (error) console.error("Erro ao arquivar despesas:", error);
         });
+      const temCriacoesAtivas = filaAcoes.some(
+        (a) => a.tipo === "criar" && !a.despesa.archivado
+      );
+      if (temCriacoesAtivas) {
+        setFilaAcoes((prev) => {
+          const nova = prev.map((a) =>
+            a.tipo === "criar" ? { ...a, despesa: { ...a.despesa, archivado: true } } : a
+          );
+          AsyncStorage.setItem(chaveFila, JSON.stringify(nova)).catch(() => {});
+          return nova;
+        });
+      }
     }
-  }, [despesas, transacoes, grupo.id]);
+  }, [despesasCombinadas, transacoes, grupo.id, chaveFila]);
 
   const renomearGrupo = () => {
     const nome = nomeEditado.trim();
@@ -464,10 +758,18 @@ function TelaGrupo({ grupo, deviceId, onVoltar }) {
         text: "Apagar",
         style: "destructive",
         onPress: async () => {
+          if (despesa.pendente || despesa.pendenteEdicao) {
+            enfileirarAcao({ tipo: "apagar", despesaId: despesa.id });
+            return;
+          }
           try {
             const { error } = await supabase.from("despesas").delete().eq("id", despesa.id);
             if (error) throw error;
           } catch (e) {
+            if (erroDeRede(e)) {
+              enfileirarAcao({ tipo: "apagar", despesaId: despesa.id });
+              return;
+            }
             console.error("Erro ao apagar despesa:", e);
             Alert.alert("Erro", "Não foi possível apagar a despesa.");
           }
@@ -530,12 +832,15 @@ function TelaGrupo({ grupo, deviceId, onVoltar }) {
             </TouchableOpacity>
           </View>
           <View style={styles.chipsLinha}>
-            {pessoas.length === 0 && (
+            {pessoasCombinadas.length === 0 && (
               <Text style={styles.textoVazio}>Ainda sem pessoas neste grupo.</Text>
             )}
-            {pessoas.map((p) => (
+            {pessoasCombinadas.map((p) => (
               <View key={p.id} style={styles.chipPessoa}>
-                <Text style={styles.chipPessoaTexto}>{p.nome}</Text>
+                <Text style={styles.chipPessoaTexto}>
+                  {p.nome}
+                  {p.pendente ? " ⏳" : ""}
+                </Text>
               </View>
             ))}
           </View>
@@ -546,7 +851,7 @@ function TelaGrupo({ grupo, deviceId, onVoltar }) {
             <Text style={styles.seccaoTitulo}>Despesas</Text>
             <TouchableOpacity
               onPress={() => {
-                if (pessoas.length === 0) {
+                if (pessoasCombinadas.length === 0) {
                   Alert.alert("Adiciona pessoas primeiro", "Precisas de pelo menos uma pessoa no grupo.");
                   return;
                 }
@@ -558,11 +863,11 @@ function TelaGrupo({ grupo, deviceId, onVoltar }) {
             </TouchableOpacity>
           </View>
 
-          {despesas.length === 0 && (
+          {despesasCombinadas.length === 0 && (
             <Text style={styles.textoVazio}>Ainda sem despesas.</Text>
           )}
 
-          {despesas
+          {despesasCombinadas
             .filter((d) => !!d.archivado === mostrarArquivadas)
             .map((d) => (
             <View key={d.id} style={styles.itemDespesa}>
@@ -575,8 +880,10 @@ function TelaGrupo({ grupo, deviceId, onVoltar }) {
               <View style={styles.itemDespesaBaixo}>
                 <Text style={styles.itemDespesaDetalhe}>
                   {nomePessoa(d.pago_por)} pagou · {d.data}
+                  {d.pendente ? " · ⏳ por sincronizar" : ""}
+                  {d.pendenteEdicao ? " · ✏️ edição por sincronizar" : ""}
                 </Text>
-                {d.criado_por === deviceId && !d.archivado && (
+                {d.pendente || d.pendenteEdicao ? (
                   <View style={styles.itemDespesaAcoes}>
                     <TouchableOpacity
                       onPress={() => {
@@ -593,12 +900,31 @@ function TelaGrupo({ grupo, deviceId, onVoltar }) {
                       </Text>
                     </TouchableOpacity>
                   </View>
+                ) : (
+                  d.criado_por === deviceId && !d.archivado && (
+                    <View style={styles.itemDespesaAcoes}>
+                      <TouchableOpacity
+                        onPress={() => {
+                          setDespesaEditar(d);
+                          setModalDespesaVisivel(true);
+                        }}
+                        style={styles.itemDespesaBotao}
+                      >
+                        <Text style={styles.itemDespesaBotaoTexto}>Editar</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity onPress={() => apagarDespesa(d)} style={styles.itemDespesaBotao}>
+                        <Text style={[styles.itemDespesaBotaoTexto, styles.itemDespesaBotaoApagar]}>
+                          Apagar
+                        </Text>
+                      </TouchableOpacity>
+                    </View>
+                  )
                 )}
               </View>
             </View>
           ))}
 
-          {despesas.some((d) => d.archivado) && (
+          {despesasCombinadas.some((d) => d.archivado) && (
             <TouchableOpacity onPress={() => setMostrarArquivadas((v) => !v)}>
               <Text style={styles.seccaoAcao}>
                 {mostrarArquivadas ? "Ver despesas ativas" : "Ver histórico arquivado"}
@@ -676,8 +1002,9 @@ function TelaGrupo({ grupo, deviceId, onVoltar }) {
           visivel={modalDespesaVisivel}
           grupoId={grupo.id}
           deviceId={deviceId}
-          pessoas={pessoas}
+          pessoas={pessoasCombinadas}
           despesaEditar={despesaEditar}
+          onAcaoPendente={enfileirarAcao}
           onFechar={() => {
             setModalDespesaVisivel(false);
             setDespesaEditar(null);
@@ -694,7 +1021,7 @@ const TIPOS_DIVISAO = [
   { valor: "percentagens", etiqueta: "%" }
 ];
 
-function ModalDespesa({ visivel, grupoId, deviceId, pessoas, despesaEditar, onFechar }) {
+function ModalDespesa({ visivel, grupoId, deviceId, pessoas, despesaEditar, onAcaoPendente, onFechar }) {
   const editando = !!despesaEditar;
 
   const [descricao, setDescricao] = useState(despesaEditar?.descricao || "");
@@ -812,6 +1139,31 @@ function ModalDespesa({ visivel, grupoId, deviceId, pessoas, despesaEditar, onFe
     }
 
     setAGuardar(true);
+
+    // Ainda nem chegou a existir no servidor (foi criada offline) — só
+    // atualiza a fila local, nunca tenta ir ao servidor para isto.
+    if (editando && despesaEditar.pendente) {
+      const divisaoArray = Object.entries(divisaoFinal).map(([pessoaId, val]) => ({
+        pessoa_id: pessoaId,
+        valor: val
+      }));
+      onAcaoPendente({
+        tipo: "editar",
+        despesa: {
+          id: despesaEditar.id,
+          descricao: descricaoLimpa,
+          valor: totalNumero,
+          pago_por: pagoPor,
+          tipo_divisao: tipoDivisao,
+          data,
+          despesas_divisao: divisaoArray
+        }
+      });
+      setAGuardar(false);
+      onFechar();
+      return;
+    }
+
     try {
       let despesaId = despesaEditar?.id;
       if (editando) {
@@ -856,6 +1208,50 @@ function ModalDespesa({ visivel, grupoId, deviceId, pessoas, despesaEditar, onFe
 
       onFechar();
     } catch (e) {
+      if (erroDeRede(e)) {
+        const divisaoArray = Object.entries(divisaoFinal).map(([pessoaId, val]) => ({
+          pessoa_id: pessoaId,
+          valor: val
+        }));
+        if (editando) {
+          onAcaoPendente({
+            tipo: "editar",
+            despesa: {
+              id: despesaId,
+              descricao: descricaoLimpa,
+              valor: totalNumero,
+              pago_por: pagoPor,
+              tipo_divisao: tipoDivisao,
+              data,
+              despesas_divisao: divisaoArray
+            }
+          });
+        } else {
+          onAcaoPendente({
+            tipo: "criar",
+            despesa: {
+              id: `local-${gerarId()}`,
+              grupo_id: grupoId,
+              descricao: descricaoLimpa,
+              valor: totalNumero,
+              pago_por: pagoPor,
+              tipo_divisao: tipoDivisao,
+              data,
+              criado_por: deviceId,
+              archivado: false,
+              despesas_divisao: divisaoArray
+            }
+          });
+        }
+        Alert.alert(
+          "Sem ligação",
+          editando
+            ? "A alteração foi guardada no telemóvel e vai sincronizar quando tiveres internet."
+            : "A despesa foi guardada no telemóvel e vai sincronizar quando tiveres internet."
+        );
+        onFechar();
+        return;
+      }
       console.error("Erro ao guardar despesa:", e);
       Alert.alert("Erro", "Não foi possível guardar a despesa.");
     } finally {
